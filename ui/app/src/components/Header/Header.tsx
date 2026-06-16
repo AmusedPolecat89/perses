@@ -12,43 +12,35 @@
 // limitations under the License.
 
 import { Link as RouterLink } from 'react-router-dom';
-import { AppBar, Box, Button, Divider, Toolbar } from '@mui/material';
-import Cog from 'mdi-material-ui/Cog';
-import ShieldStar from 'mdi-material-ui/ShieldStar';
-import Compass from 'mdi-material-ui/Compass';
+import { AppBar, Badge, Box, Button, Toolbar } from '@mui/material';
+import ServerNetwork from 'mdi-material-ui/ServerNetwork';
+import RocketLaunchOutline from 'mdi-material-ui/RocketLaunchOutline';
 import React from 'react';
 import { useIsLaptopSize, useIsMobileSize } from '../../utils/browser-size';
-import { AdminRoute, ConfigRoute } from '../../model/route';
-import { useIsAuthEnabled, useIsExplorerEnabled } from '../../context/Config';
-import { GlobalProject, useHasPartialPermission } from '../../context/Authorization';
+import { useIsAuthEnabled } from '../../context/Config';
+import { useOnboarded } from '../../views/onboarding/use-onboarded';
+import { projectRoute } from '../../model/project';
 import WhitePersesLogo from '../logo/WhitePersesLogo';
 import PersesLogoCropped from '../logo/PersesLogoCropped';
 import { BannerInfo } from '../BannerInfo';
-import { ToolMenu } from './ToolMenu';
 import { AccountMenu } from './AccountMenu';
-import { ThemeSwitch } from './ThemeSwitch';
 import { SearchBar } from './SearchBar/SearchBar';
 
 export default function Header(): JSX.Element {
   const isLaptopSize = useIsLaptopSize();
   const isMobileSize = useIsMobileSize();
   const isAuthEnabled = useIsAuthEnabled();
-  const IsExplorerEnabled = useIsExplorerEnabled();
-
-  const hasPartialPermission = useHasPartialPermission(['read'], GlobalProject, [
-    'GlobalDatasource',
-    'GlobalRole',
-    'GlobalRoleBinding',
-    'GlobalSecret',
-    'GlobalVariable',
-    'User',
-  ]);
+  const { isComplete: onboardingComplete } = useOnboarded();
 
   return (
     <AppBar position="relative">
       <Toolbar
         sx={{
-          backgroundColor: (theme) => theme.palette.designSystem.blue[700],
+          backgroundColor: (theme) => theme.palette.background.navigation,
+          // The header is always rendered on the dark ink surface — even
+          // in light mode. Force text + icons to paper-white so the brand
+          // mark, search, and account menu stay readable.
+          color: (theme) => theme.palette.text.navigation,
           '&': {
             minHeight: '40px',
             paddingLeft: 0,
@@ -67,57 +59,49 @@ export default function Header(): JSX.Element {
         >
           <Button
             component={RouterLink}
-            to="/"
+            to={projectRoute()}
             sx={{
               padding: 0,
             }}
+            aria-label="Project dashboards"
           >
             {isLaptopSize ? <WhitePersesLogo /> : <PersesLogoCropped color="white" width={32} height={32} />}
           </Button>
-          <Divider
-            orientation="vertical"
-            flexItem
-            sx={{ borderRightColor: 'rgba(255,255,255,0.2)', marginRight: 0.5 }}
-          />
-          {!isMobileSize ? (
+          {/* OBSESC β.3.1: Admin / Config / Explore nav stripped — the
+              brief calls for a single-operator surface with no plugin
+              catalog / datasource manager visible. Theme toggle hidden
+              so dark default holds without a tempting one-click switch.
+              Cluster is the one operational surface we keep, since
+              vertical scaling is the headline ops action. */}
+          {!isMobileSize && (
             <>
-              {hasPartialPermission && (
-                <Button
-                  aria-label="Administration"
-                  aria-controls="menu-admin-appbar"
-                  aria-haspopup="true"
-                  color="inherit"
-                  component={RouterLink}
-                  to={AdminRoute}
-                >
-                  <ShieldStar sx={{ marginRight: 0.5 }} /> Admin
-                </Button>
-              )}
               <Button
-                aria-label="Config"
-                aria-controls="menu-config-appbar"
-                aria-haspopup="true"
+                aria-label="Onboarding"
                 color="inherit"
                 component={RouterLink}
-                to={ConfigRoute}
+                to="/onboarding"
+                sx={{ marginLeft: 1 }}
               >
-                <Cog sx={{ marginRight: 0.5 }} /> Config
-              </Button>
-              {IsExplorerEnabled && (
-                <Button
-                  aria-label="Explore"
-                  aria-controls="menu-config-appbar"
-                  aria-haspopup="true"
-                  color="inherit"
-                  component={RouterLink}
-                  to="/explore"
+                <Badge
+                  color="primary"
+                  variant="dot"
+                  invisible={onboardingComplete}
+                  sx={{ marginRight: 0.5 }}
                 >
-                  <Compass sx={{ marginRight: 0.5 }} /> Explore
-                </Button>
-              )}
+                  <RocketLaunchOutline fontSize="small" />
+                </Badge>
+                <Box sx={{ marginLeft: 0.5 }}>Onboarding</Box>
+              </Button>
+              <Button
+                aria-label="Cluster"
+                color="inherit"
+                component={RouterLink}
+                to="/cluster"
+                sx={{ marginLeft: 0.5 }}
+              >
+                <ServerNetwork sx={{ marginRight: 0.5 }} fontSize="small" /> Cluster
+              </Button>
             </>
-          ) : (
-            <ToolMenu />
           )}
         </Box>
         <SearchBar />
@@ -129,7 +113,7 @@ export default function Header(): JSX.Element {
             justifyContent: 'end',
           }}
         >
-          {isAuthEnabled ? <AccountMenu /> : <ThemeSwitch isAuthEnabled={false} />}
+          {isAuthEnabled && <AccountMenu />}
         </Box>
       </Toolbar>
       <BannerInfo />

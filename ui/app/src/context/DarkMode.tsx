@@ -12,7 +12,7 @@
 // limitations under the License.
 
 import React, { createContext, ReactElement, useContext, useMemo } from 'react';
-import { CssBaseline, ThemeProvider, useMediaQuery } from '@mui/material';
+import { createTheme, CssBaseline, ThemeProvider } from '@mui/material';
 import {
   ChartsProvider,
   generateChartsTheme,
@@ -20,11 +20,16 @@ import {
   getTheme,
   useLocalStorage,
 } from '@perses-dev/components';
+import { buildObsescThemeOptions } from '../theme/obsesc';
 
 // app specific echarts option overrides, empty since perses uses default
 // https://apache.github.io/echarts-handbook/en/concepts/style/#theme
 const ECHARTS_THEME_OVERRIDES = {};
 
+// Operator UI ships dark-first — dashboards live on production monitors
+// under load, not phones in bright rooms. Browser pref is ignored on
+// purpose so a fresh AMI always boots dark; the user can still toggle
+// it via the header switch and the choice survives via localStorage.
 const DARK_MODE_PREFERENCE_KEY = 'PERSES_ENABLE_DARK_MODE';
 
 interface DarkModeContext {
@@ -38,9 +43,7 @@ export const DarkModeContext = createContext<DarkModeContext | undefined>(undefi
  * Acts as theme provider for MUI and allows switching to dark mode.
  */
 export function DarkModeContextProvider(props: { children: React.ReactNode }): ReactElement {
-  const browserPrefersDarkMode = useMediaQuery('(prefers-color-scheme: dark)');
-
-  const [isDarkModeEnabled, setDarkMode] = useLocalStorage<boolean>(DARK_MODE_PREFERENCE_KEY, browserPrefersDarkMode);
+  const [isDarkModeEnabled, setDarkMode] = useLocalStorage<boolean>(DARK_MODE_PREFERENCE_KEY, true);
 
   // store the dark mode preference in local storage
   const darkModeContext: DarkModeContext = useMemo(
@@ -51,7 +54,17 @@ export function DarkModeContextProvider(props: { children: React.ReactNode }): R
     [isDarkModeEnabled, setDarkMode]
   );
 
-  const theme = useMemo(() => getTheme(isDarkModeEnabled ? 'dark' : 'light'), [isDarkModeEnabled]);
+  // OBSESC theme override: deep-merge the brand palette + typography
+  // on top of Perses' base theme. `getTheme(mode, options)` does a
+  // shallow spread which clobbers `palette.designSystem` (used by
+  // Perses' modal-background helper), so we go in two passes:
+  // build the upstream theme, then layer our overrides via MUI's
+  // `createTheme(baseTheme, overrides)` which deep-merges.
+  const theme = useMemo(() => {
+    const mode = isDarkModeEnabled ? 'dark' : 'light';
+    const base = getTheme(mode);
+    return createTheme(base, buildObsescThemeOptions(mode));
+  }, [isDarkModeEnabled]);
   const chartsTheme: PersesChartsTheme = useMemo(() => {
     return generateChartsTheme(theme, { echartsTheme: ECHARTS_THEME_OVERRIDES });
   }, [theme]);

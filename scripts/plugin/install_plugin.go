@@ -31,7 +31,10 @@ import (
 var pluginListData []byte
 
 const (
-	githubURL           = "https://github.com/perses/perses-plugins/releases/download"
+	// OBSESC fork (readiness run #12, finding #3): upstream moved plugin
+	// releases from the dead perses/perses-plugins repo to perses/plugins
+	// (tags `<lowername>/v<version>` — the fallback branch below).
+	githubURL           = "https://github.com/perses/plugins/releases/download"
 	pluginArchiveFolder = "plugins-archive"
 )
 

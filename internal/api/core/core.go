@@ -95,6 +95,9 @@ func New(conf config.Config, enablePprof bool, registry *prometheus.Registry, ba
 		}).
 		Middleware(middleware.HandleError()).
 		Middleware(middleware.CheckProject(dependencyManager.Service().GetProject()))
+	// OBSESC: expose the co-located node's query API under /obsesc-api
+	// (mirrors the rspack dev proxy; see obsesc_proxy.go).
+	runner.HTTPServerBuilder().APIRegistration(newObsescAPIProxy())
 	if !conf.Frontend.Disable {
 		runner.HTTPServerBuilder().APIRegistration(persesFrontend)
 	}

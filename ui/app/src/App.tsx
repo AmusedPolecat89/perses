@@ -17,6 +17,7 @@ import { ReactElement, Suspense } from 'react';
 import { ReactRouterProvider } from '@perses-dev/plugin-system';
 import Header from './components/Header/Header';
 import Footer from './components/Footer';
+import { OnboardingBanner } from './components/OnboardingBanner';
 import { DelegatedAuthnErrorRoute, SignInRoute, SignUpRoute } from './model/route';
 import { PersesLoader } from './components/PersesLoader';
 import './i18n/i18n';
@@ -39,7 +40,12 @@ function App(): ReactElement {
     >
       {location.pathname !== SignInRoute &&
         location.pathname !== SignUpRoute &&
-        location.pathname !== DelegatedAuthnErrorRoute && <Header />}
+        location.pathname !== DelegatedAuthnErrorRoute && (
+          <>
+            <Header />
+            <OnboardingBanner />
+          </>
+        )}
 
       <Box
         sx={{

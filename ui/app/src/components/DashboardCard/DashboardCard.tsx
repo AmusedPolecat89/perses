@@ -30,7 +30,7 @@ export function DashboardCard({ dashboard, hideIcon }: DashboardCardProps): Reac
       fullWidth
       sx={{
         justifyContent: 'start',
-        backgroundColor: (theme) => theme.palette.designSystem.blue[700],
+        backgroundColor: (theme) => theme.palette.background.navigation,
       }}
       title={getResourceDisplayName(dashboard)}
       component={RouterLink}

@@ -43,13 +43,15 @@ import {
 import SignInView from './views/auth/SignInView';
 import SignUpView from './views/auth/SignUpView';
 import DelegatedAuthnErrorView from './views/auth/DelegatedAuthnErrorView';
-import HomeView from './views/home/HomeView';
 // Default route is eagerly loaded
 import App from './App';
+import { ProjectGuard } from './components/ProjectGuard';
 import { PERSES_APP_CONFIG } from './config';
 import { buildRedirectQueryString, useIsLoggedIn, useRedirectQueryParam } from './model/auth/auth-client';
 
 // Other routes are lazy-loaded for code-splitting
+const NodeManagerView = lazy(() => import('./views/cluster/NodeManagerView'));
+const OnboardingView = lazy(() => import('./views/onboarding/OnboardingView'));
 const ImportView = lazy(() => import('./views/import/ImportView'));
 const AdminView = lazy(() => import('./views/admin/AdminView'));
 const ConfigView = lazy(() => import('./views/config/ConfigView'));
@@ -108,7 +110,13 @@ function Router(): ReactElement {
             path: '',
             element: <RequireAuth />,
             children: [
-              { index: true, Component: HomeView },
+              // OBSESC: ProjectGuard checks the default project exists,
+              // auto-creates it if the operator deleted it, then redirects
+              // to NodeHealth. The Perses home view is a multi-project
+              // picker we don't want.
+              { index: true, element: <ProjectGuard /> },
+              { path: 'cluster', Component: NodeManagerView },
+              { path: 'onboarding', Component: OnboardingView },
               { path: ProfileRoute, Component: ProfileView },
               {
                 path: AdminRoute,

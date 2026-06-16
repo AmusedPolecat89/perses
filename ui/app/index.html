@@ -2,19 +2,26 @@
 <html lang="en">
   <head>
     <meta charset="utf-8" />
-    <link rel="icon" href="/favicon.ico" type="image/png/ico" />
+    <link rel="icon" href="/favicon.ico" type="image/png" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#000000" />
-    <meta name="description" content="Perses" />
-    <title>Perses</title>
+    <meta name="theme-color" content="#0e1729" />
+    <meta name="description" content="OBSESC observability node" />
+    <title>OBSESC</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      rel="stylesheet"
+      href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap"
+    />
     <style>
       :root {
-        color-scheme: light dark;
+        color-scheme: dark;
       }
 
       body {
         margin: 0;
         padding: 0;
+        font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
       }
 
       .loading {
@@ -24,63 +31,37 @@
         align-items: center;
         justify-content: center;
         padding: 0;
-        background-color: light-dark(#ffffff, #151721);
+        background-color: #0e1729;
+        color: #f7f6f2;
+        font-family: "Inter", system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+        font-size: 32px;
+        font-weight: 600;
+        letter-spacing: 0.4em;
+        animation: obsesc-pulse 1.6s ease-in-out infinite;
       }
 
-      .dark-theme {
-        color-scheme: dark;
+      .light-theme {
+        color-scheme: light;
+        background-color: #f7f6f2;
+        color: #0e1729;
+      }
+
+      @keyframes obsesc-pulse {
+        0%, 100% { opacity: 0.55; }
+        50% { opacity: 1; }
       }
     </style>
   </head>
   <body>
     <noscript>You need to enable JavaScript to run this app.</noscript>
     <div id="root">
-      <div id="loader" class="loading">
-        <svg width="15%" viewBox="0 0 120 120" fill="none" xmlns="http://www.w3.org/2000/svg">
-        <path d="M71.625 23H29.375C25.8542 23 23 25.8542 23 29.375C23 32.8958 25.8542 35.75 29.375 35.75H71.625C75.1458 35.75 78 32.8958 78 29.375C78 25.8542 75.1458 23 71.625 23Z"
-              fill="#DE005D">
-          <animate
-                  attributeName="fill"
-                  values="#DE005D;#f5b3ce;#DE005D"
-                  dur="1s"
-                  begin="0s"
-                  repeatCount="indefinite"/>
-        </path>
-        <path d="M91.625 43.75H49.375C45.8542 43.75 43 46.6042 43 50.125C43 53.6458 45.8542 56.5 49.375 56.5H91.625C95.1458 56.5 98 53.6458 98 50.125C98 46.6042 95.1458 43.75 91.625 43.75Z"
-              fill="#DE005D">
-          <animate
-                  attributeName="fill"
-                  values="#DE005D;#f5b3ce;#DE005D"
-                  dur="1s"
-                  begin="0.25s"
-                  repeatCount="indefinite"/>
-        </path>
-        <path d="M71.625 64.5H29.375C25.8542 64.5 23 67.3542 23 70.875C23 74.3958 25.8542 77.25 29.375 77.25H71.625C75.1458 77.25 78 74.3958 78 70.875C78 67.3542 75.1458 64.5 71.625 64.5Z"
-              fill="#DE005D">
-          <animate
-                  attributeName="fill"
-                  values="#DE005D;#f5b3ce;#DE005D"
-                  dur="1s"
-                  begin="0.5s"
-                  repeatCount="indefinite"
-          />
-        </path>
-        <path d="M36.625 85.25H29.375C25.8542 85.25 23 88.1042 23 91.625C23 95.1458 25.8542 98 29.375 98H36.625C40.1458 98 43 95.1458 43 91.625C43 88.1042 40.1458 85.25 36.625 85.25Z"
-              fill="#DE005D">
-          <animate
-                  attributeName="fill"
-                  values="#DE005D;#f5b3ce;#DE005D"
-                  dur="1s"
-                  begin="0.75s"
-                  repeatCount="indefinite"
-          />
-        </path>
-      </svg>
-      </div>
+      <div id="loader" class="loading">[&nbsp;&nbsp;]</div>
       <script>
-        const isDarkTheme = localStorage.getItem('perses-dark-theme-enabled') === 'true';
-        if (isDarkTheme) {
-          document.getElementById('loader').classList.add('dark-theme');
+        // Default to dark; only flip to the light-themed loader when the
+        // operator has explicitly chosen light mode in a prior session.
+        const stored = localStorage.getItem('PERSES_ENABLE_DARK_MODE');
+        if (stored === 'false') {
+          document.getElementById('loader').classList.add('light-theme');
         }
       </script>
     </div>

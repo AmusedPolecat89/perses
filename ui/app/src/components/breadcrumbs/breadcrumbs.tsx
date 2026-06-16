@@ -22,7 +22,7 @@ import {
 import { SxProps, SystemStyleObject, Theme } from '@mui/system';
 import ChevronRight from 'mdi-material-ui/ChevronRight';
 import { Link as RouterLink } from 'react-router-dom';
-import { ReactElement } from 'react';
+import { ReactElement, ReactNode } from 'react';
 
 export type BreadcrumbVariant = 'default' | 'workspace';
 
@@ -101,12 +101,12 @@ export function Breadcrumbs(props: BreadcrumbsProps): ReactElement {
   );
 }
 
-export function HomeLinkCrumb({ variant }: { variant?: BreadcrumbVariant }): ReactElement {
-  return (
-    <LinkCrumb to="/" variant={variant}>
-      Home
-    </LinkCrumb>
-  );
+export function HomeLinkCrumb(_props: { variant?: BreadcrumbVariant }): ReactNode {
+  // OBSESC β.3.1: `/` redirects straight to the NodeHealth dashboard,
+  // so a "Home" crumb is a no-op visually and confusing semantically.
+  // Return `null` (not an empty fragment) so MUI's Breadcrumbs
+  // doesn't insert a leading "/" separator before the project crumb.
+  return null;
 }
 
 export interface StackCrumbProps {

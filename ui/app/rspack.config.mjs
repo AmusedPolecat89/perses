@@ -135,6 +135,20 @@ export default defineConfig({
             context: ['/api', '/proxy', '/plugins'],
             target: 'http://localhost:8080',
           },
+          {
+            // OBSESC backend (obsesc-node) lives on :18080. The browser
+            // hits /obsesc-api/<path> and we forward to /<path>.
+            context: ['/obsesc-api'],
+            target: 'http://localhost:18080',
+            pathRewrite: { '^/obsesc-api': '' },
+          },
+          {
+            // Prometheus (scrapes obsesc-node /metrics) on :9090.
+            // Browser hits /prom-api/<path> → /<path>.
+            context: ['/prom-api'],
+            target: 'http://localhost:9090',
+            pathRewrite: { '^/prom-api': '' },
+          },
         ],
         client: {
           // By default, the error overlay is not shown because it can get in the
