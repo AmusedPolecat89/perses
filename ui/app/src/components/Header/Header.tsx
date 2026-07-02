@@ -15,6 +15,7 @@ import { Link as RouterLink } from 'react-router-dom';
 import { AppBar, Badge, Box, Button, Toolbar } from '@mui/material';
 import ServerNetwork from 'mdi-material-ui/ServerNetwork';
 import RocketLaunchOutline from 'mdi-material-ui/RocketLaunchOutline';
+import CompassOutline from 'mdi-material-ui/CompassOutline';
 import React from 'react';
 import { useIsLaptopSize, useIsMobileSize } from '../../utils/browser-size';
 import { useIsAuthEnabled } from '../../context/Config';
@@ -100,6 +101,15 @@ export default function Header(): JSX.Element {
                 sx={{ marginLeft: 0.5 }}
               >
                 <ServerNetwork sx={{ marginRight: 0.5 }} fontSize="small" /> Cluster
+              </Button>
+              <Button
+                aria-label="Explore"
+                color="inherit"
+                component={RouterLink}
+                to="/explore"
+                sx={{ marginLeft: 0.5 }}
+              >
+                <CompassOutline sx={{ marginRight: 0.5 }} fontSize="small" /> Explore
               </Button>
             </>
           )}

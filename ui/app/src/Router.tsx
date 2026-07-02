@@ -52,6 +52,7 @@ import { buildRedirectQueryString, useIsLoggedIn, useRedirectQueryParam } from '
 // Other routes are lazy-loaded for code-splitting
 const NodeManagerView = lazy(() => import('./views/cluster/NodeManagerView'));
 const OnboardingView = lazy(() => import('./views/onboarding/OnboardingView'));
+const ObsescExploreView = lazy(() => import('./views/obsesc-explore/ObsescExploreView'));
 const ImportView = lazy(() => import('./views/import/ImportView'));
 const AdminView = lazy(() => import('./views/admin/AdminView'));
 const ConfigView = lazy(() => import('./views/config/ConfigView'));
@@ -59,7 +60,7 @@ const GuardedProjectRoute = lazy(() => import('./guard/GuardedProjectRoute'));
 const ProjectView = lazy(() => import('./views/projects/ProjectView'));
 const CreateDashboardView = lazy(() => import('./views/projects/dashboards/CreateDashboardView'));
 const DashboardView = lazy(() => import('./views/projects/dashboards/DashboardView'));
-const ExploreView = lazy(() => import('./views/explore/ExploreView'));
+// OBSESC: upstream ExploreView retired in favour of ObsescExploreView.
 const CreateEphemeralDashboardView = lazy(() => import('./views/projects/dashboards/CreateEphemeralDashboardView'));
 const EphemeralDashboardView = lazy(() => import('./views/projects/dashboards/EphemeralDashboardView'));
 const ProfileView = lazy(() => import('./views/profile/ProfileView'));
@@ -128,10 +129,12 @@ function Router(): ReactElement {
               { path: ConfigRoute, Component: ConfigView },
               { path: ImportRoute, Component: ImportView },
               { path: ProjectRoute, Component: ProjectView },
+              // OBSESC: the upstream Perses Explore (metrics explorer behind
+              // RequireExplorerEnabled) is replaced by the OBSESC Explore —
+              // SQL over raw_events (micro-Athena) + needle search.
               {
                 path: ExploreRoute,
-                element: <RequireExplorerEnabled />,
-                children: [{ index: true, Component: ExploreView }],
+                Component: ObsescExploreView,
               },
               {
                 path: ProjectRoute,
