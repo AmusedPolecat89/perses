@@ -24,6 +24,10 @@ interface NodeCardProps {
   stats: NodeStats | undefined;
   isLoading: boolean;
   error: unknown;
+  /// Peer member (from /v1/cluster) whose stats aren't scraped from this
+  /// browser session — renders a membership card with the advertised addr
+  /// instead of live gauges.
+  peerAddr?: string;
   onResize: () => void;
 }
 
@@ -38,6 +42,12 @@ function bytesPretty(n: number): string {
   return `${n.toFixed(n < 10 ? 2 : n < 100 ? 1 : 0)} ${units[i]}`;
 }
 
+// Sources that have actually sent bytes — the meter reports all eight
+// protocol labels including the zeros, which read as noise on the card.
+function activeSources(bySource: Record<string, number>): number {
+  return Object.values(bySource).filter((v) => v > 0).length;
+}
+
 function budgetColor(pct: number): 'success' | 'warning' | 'error' {
   if (pct >= 0.9) return 'error';
   if (pct >= 0.8) return 'warning';
@@ -50,12 +60,44 @@ export function NodeCard({
   stats,
   isLoading,
   error,
+  peerAddr,
   onResize,
 }: NodeCardProps): ReactElement {
   const spec = findInstance(instanceId);
   const healthy = stats?.healthy ?? false;
   const totalBytes = stats?.totalIngestBytesCumulative ?? 0;
   const budgets = stats?.budgets ?? {};
+
+  // A peer member: in the ring (that's how we know about it), but its
+  // gauges aren't scraped from this browser session.
+  if (peerAddr !== undefined) {
+    return (
+      <Box
+        sx={{
+          borderRadius: 1.5,
+          border: '1px solid',
+          borderColor: 'background.border',
+          backgroundColor: 'background.paper',
+          padding: 2.5,
+          minWidth: 360,
+        }}
+      >
+        <Stack direction="row" alignItems="center" gap={1}>
+          <Typography variant="h6" sx={{ fontWeight: 600 }}>
+            {name}
+          </Typography>
+          <Chip size="small" label="active member" color="success" variant="outlined" />
+        </Stack>
+        <Typography variant="caption" color="text.secondary">
+          peer · {peerAddr || 'no advertised address'}
+        </Typography>
+        <Typography variant="body2" color="text.secondary" sx={{ mt: 2 }}>
+          In the ring at the current epoch. Open this node&apos;s own dashboard for
+          its live gauges.
+        </Typography>
+      </Box>
+    );
+  }
 
   return (
     <Box
@@ -94,10 +136,19 @@ export function NodeCard({
 
       <Box sx={{ mt: 2 }}>
         <Typography variant="overline" color="text.secondary">
-          Ingest
+          Committed throughput
         </Typography>
         <Typography variant="body1">
-          {isLoading && !stats ? '…' : `${bytesPretty(totalBytes)} cumulative across ${Object.keys(stats?.bytesBySource ?? {}).length} sources`}
+          {isLoading && !stats
+            ? '…'
+            : stats?.committedMBps == null
+              ? 'measuring…'
+              : `${stats.committedMBps.toFixed(1)} MB/s committed`}
+        </Typography>
+        <Typography variant="caption" color="text.secondary">
+          {stats
+            ? `${bytesPretty(stats.committedBytesCumulative)} committed total · ${bytesPretty(totalBytes)} received (pre-admission) from ${activeSources(stats.bytesBySource)} source${activeSources(stats.bytesBySource) === 1 ? '' : 's'}`
+            : ''}
         </Typography>
       </Box>
 
@@ -133,6 +184,21 @@ export function NodeCard({
       </Box>
 
       <Stack direction="row" gap={3} sx={{ mt: 1.5 }}>
+        <Box>
+          <Typography variant="overline" color="text.secondary">
+            Summary backlog
+          </Typography>
+          <Tooltip title="Committed raw files the from_raw driver hasn't summarised yet — lag is by design under burst; raw never throttles.">
+            <Typography
+              variant="body2"
+              sx={{
+                color: (stats?.summaryBacklogFiles ?? 0) > 500 ? 'error.main' : undefined,
+              }}
+            >
+              {stats ? `${stats.summaryBacklogFiles} files` : '—'}
+            </Typography>
+          </Tooltip>
+        </Box>
         <Box>
           <Typography variant="overline" color="text.secondary">
             Summary buckets

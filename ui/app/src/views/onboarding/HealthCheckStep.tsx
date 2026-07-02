@@ -23,7 +23,7 @@ const CHECKS: CheckRow[] = [
   {
     label: '/metrics',
     href: '/obsesc-api/metrics',
-    expect: 'Prometheus text exposition. Look for obsesc_ingest_bytes_total.',
+    expect: 'Prometheus text exposition. Look for obsesc_wal_committed_bytes (the honest throughput meter).',
   },
   {
     label: '/v1/query',

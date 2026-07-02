@@ -10,8 +10,16 @@ import { useQuery, UseQueryResult } from '@tanstack/react-query';
 export interface NodeStats {
   // True if /v1/health returned 200 recently.
   healthy: boolean;
-  // Bytes/sec ingest across all sources (instantaneous, not rate()'d
-  // — we have a single scrape so we can't compute a rate locally).
+  // Cumulative bytes durably committed through the WAL checkpoint —
+  // the HONEST meter (received counts pre-admission and over-reads
+  // under shed). Summed across shards.
+  committedBytesCumulative: number;
+  // Committed MB/s derived from the delta between this poll and the
+  // previous one. null until two samples exist.
+  committedMBps: number | null;
+  // from_raw driver lag: committed raw files not yet summarised.
+  summaryBacklogFiles: number;
+  // Received (pre-admission) cumulative bytes across all sources.
   totalIngestBytesCumulative: number;
   // Per-source instantaneous cumulative bytes.
   bytesBySource: Record<string, number>;
@@ -36,6 +44,9 @@ function parsePrometheus(text: string): NodeStats {
   const lines = text.split('\n');
   const stats: NodeStats = {
     healthy: true,
+    committedBytesCumulative: 0,
+    committedMBps: null,
+    summaryBacklogFiles: 0,
     totalIngestBytesCumulative: 0,
     bytesBySource: {},
     budgets: {},
@@ -89,6 +100,12 @@ function parsePrometheus(text: string): NodeStats {
           else stats.walShards.push({ shard: labels.shard, segment: 0, offset: value });
         }
         break;
+      case 'obsesc_wal_committed_bytes':
+        stats.committedBytesCumulative += value;
+        break;
+      case 'obsesc_summary_unsummarised_backlog_files':
+        stats.summaryBacklogFiles = value;
+        break;
       case 'obsesc_summary_buckets_open':
         stats.summaryBucketsOpen = value;
         break;
@@ -118,6 +135,10 @@ function parsePrometheus(text: string): NodeStats {
   return stats;
 }
 
+// Previous committed-bytes sample, module-scoped so the rate survives
+// component remounts. A single scrape can't rate() itself; two can.
+let prevCommitted: { bytes: number; atMs: number } | null = null;
+
 export function useNodeStats(refetchIntervalMs = 5_000): UseQueryResult<NodeStats> {
   return useQuery<NodeStats>({
     queryKey: ['obsesc-node-stats'],
@@ -133,6 +154,14 @@ export function useNodeStats(refetchIntervalMs = 5_000): UseQueryResult<NodeStat
       const text = await metricsRes.text();
       const stats = parsePrometheus(text);
       stats.healthy = healthRes.ok;
+      const now = Date.now();
+      if (prevCommitted && now > prevCommitted.atMs) {
+        const dBytes = stats.committedBytesCumulative - prevCommitted.bytes;
+        const dSec = (now - prevCommitted.atMs) / 1000;
+        // Negative delta = node restarted (gauge reset); skip that sample.
+        stats.committedMBps = dBytes >= 0 ? dBytes / dSec / 1024 / 1024 : null;
+      }
+      prevCommitted = { bytes: stats.committedBytesCumulative, atMs: now };
       return stats;
     },
   });
