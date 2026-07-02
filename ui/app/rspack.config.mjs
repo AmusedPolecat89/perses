@@ -134,12 +134,22 @@ export default defineConfig({
           {
             context: ['/api', '/proxy', '/plugins'],
             target: 'http://localhost:8080',
+            // Module-federation entry manifests (mf-manifest.json) are
+            // served un-hashed; heuristic browser caching pins stale
+            // plugin bundles across rebuilds (hard reload does NOT bust
+            // async federation chunks). no-store ends that class of bug.
+            // (http-proxy-middleware v2 option name.)
+            onProxyRes: (proxyRes) => {
+              proxyRes.headers['cache-control'] = 'no-store';
+            },
           },
           {
             // OBSESC backend (obsesc-node) lives on :18080. The browser
             // hits /obsesc-api/<path> and we forward to /<path>.
+            // OBSESC_API_TARGET points the dev UI at a remote node
+            // (e.g. the demo cluster's node1) without a config edit.
             context: ['/obsesc-api'],
-            target: 'http://localhost:18080',
+            target: process.env.OBSESC_API_TARGET ?? 'http://localhost:18080',
             pathRewrite: { '^/obsesc-api': '' },
           },
           {
