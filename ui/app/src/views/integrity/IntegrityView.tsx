@@ -2,21 +2,29 @@
 //
 // Integrity — chain-of-custody verification (Lane U6).
 //
-// Every flushed .obsc carries a custody node hash-linked to its
-// predecessor (per-chain: `service` or `service#subshard`). This view
-// walks one chain from its persisted head back toward genesis, re-hashing
-// every claimed file server-side, and renders the auditor-facing verdict.
+// Every flushed .obsc summary window carries a custody node hash-linked
+// to its predecessor (per-chain: `service` or `service#subshard`). This
+// view walks one chain from its persisted head back toward genesis,
+// re-hashing every claimed file server-side, and renders the
+// auditor-facing verdict.
 //
 // HONESTY CONTRACT: the verdict card IS the product — a hash mismatch is
-// never a generic error. The echoed effective `from_ns` (any retention
-// clamp applied by the server) renders as "verified back to …", and
-// `truncated` / `history_truncated` get explicit non-dismissable copy.
+// never a generic error. Semantics of the report's honesty fields (per
+// obsesc_summary::custody::VerifyReport, the frozen wire contract):
+//   - `from_ns` echoes the EFFECTIVE lower bound the walk ran with; the
+//     server raises it to the retention horizon when the chain's tail
+//     has aged out. "verified back to …" is only true of a COMPLETE
+//     walk — an incomplete one never reached the bound.
+//   - `truncated` = the walk stopped at max_files before completing
+//     (NOT retention): no break found is then only a partial verdict.
+//   - `history_truncated` = a node's recorded supersession history was
+//     truncated (MAX_SUPERSEDED_LINKS) — also not retention.
 //
 // Fetches go straight to /obsesc-api (same direct-fetch pattern as
 // ObsescExploreView / use-node-stats): the plugin client is not
 // importable from app views.
 
-import { ReactElement, useRef, useState } from 'react';
+import { ReactElement, useEffect, useRef, useState } from 'react';
 import {
   Alert,
   Box,
@@ -96,6 +104,7 @@ interface CustodyVerifyReport {
   complete: boolean;
   /** Walk stopped at max_files before completing. */
   truncated: boolean;
+  /** A node's recorded supersession history was truncated. */
   history_truncated: boolean;
   first_break: CustodyBreak | null;
 }
@@ -151,7 +160,7 @@ const BREAK_COPY: Record<CustodyBreakKind, { name: string; explain: string }> = 
 };
 
 function tsPretty(ns: number): string {
-  return new Date(ns / 1e6).toISOString().replace('T', ' ').slice(0, 19);
+  return `${new Date(ns / 1e6).toISOString().replace('T', ' ').slice(0, 19)} UTC`;
 }
 
 /**
@@ -254,43 +263,48 @@ function EvidenceBlock({ report }: { report: CustodyVerifyReport }): ReactElemen
   );
 }
 
-function VerdictCard({ report }: { report: CustodyVerifyReport }): ReactElement {
+function VerdictCard({
+  report,
+  requestedFromNs,
+}: {
+  report: CustodyVerifyReport;
+  /** The from_ns the operator asked for (null = none) — so a server-raised
+   *  bound (retention horizon) can be labeled as such. */
+  requestedFromNs: number | null;
+}): ReactElement {
   const brk = report.first_break;
-  const verified = brk === null;
-  // The echoed effective lower bound — includes any retention clamp the
-  // server applied. Render it, always (PR standard #3).
-  const verifiedBackTo =
-    report.from_ns !== null
-      ? `verified back to ${tsPretty(report.from_ns)} (effective lower bound, as echoed by the node)`
-      : report.complete
-        ? 'verified back to genesis'
-        : null;
+  // Three verdict severities:
+  //   break   (red)   — first_break reported;
+  //   partial (amber) — no break found, but the walk stopped at max_files
+  //                     before completing: only the walked files are vouched for;
+  //   verified (green)— walk reached genesis or the bound with no break.
+  const verdict = brk !== null ? brk.kind : report.complete ? 'verified' : 'partial';
+  const borderColor =
+    brk !== null ? 'error.main' : report.complete ? 'success.main' : 'warning.main';
+
+  // "verified back to …" is only true of a COMPLETE walk. The server may
+  // have raised the bound to the retention horizon — label that honestly.
+  const raisedByServer =
+    report.from_ns !== null && (requestedFromNs === null || report.from_ns > requestedFromNs);
+  const verifiedBackTo = report.complete
+    ? report.from_ns !== null
+      ? `verified back to ${tsPretty(report.from_ns)}${
+          raisedByServer ? ' (raised by the server — retention horizon)' : ''
+        }`
+      : 'verified back to genesis'
+    : null;
 
   return (
     <Box
       data-testid="integrity-verdict"
-      data-verdict={verified ? 'verified' : brk.kind}
+      data-verdict={verdict}
       sx={{
         ...card,
-        borderColor: verified ? 'success.main' : 'error.main',
+        borderColor,
         borderWidth: 2,
       }}
     >
-      {verified ? (
-        <>
-          <Stack direction="row" gap={1} alignItems="center">
-            <Chip size="small" color="success" label="verified" />
-            <Typography variant="h6" sx={{ fontWeight: 600 }}>
-              Chain intact — no break found
-            </Typography>
-          </Stack>
-          <Typography variant="body2" sx={{ mt: 1 }}>
-            {report.nodes_verified.toLocaleString()} file
-            {report.nodes_verified === 1 ? '' : 's'} re-hashed and verified
-            {verifiedBackTo ? ` — ${verifiedBackTo}` : ''}.
-          </Typography>
-        </>
-      ) : (
+      {brk !== null ? (
         <>
           <Stack direction="row" gap={1} alignItems="center">
             <Chip size="small" color="error" label={brk.kind} sx={mono} />
@@ -301,23 +315,50 @@ function VerdictCard({ report }: { report: CustodyVerifyReport }): ReactElement 
           <Typography variant="body2" sx={{ mt: 1 }}>
             {BREAK_COPY[brk.kind]?.explain ?? ''} The walk verified{' '}
             {report.nodes_verified.toLocaleString()} file
-            {report.nodes_verified === 1 ? '' : 's'} between the head and this break
-            {verifiedBackTo ? `; ${verifiedBackTo}` : ''}.
+            {report.nodes_verified === 1 ? '' : 's'} between the head and this break.
           </Typography>
           <EvidenceBlock report={report} />
         </>
+      ) : report.complete ? (
+        <>
+          <Stack direction="row" gap={1} alignItems="center">
+            <Chip size="small" color="success" label="verified" />
+            <Typography variant="h6" sx={{ fontWeight: 600 }}>
+              Chain intact — no break found
+            </Typography>
+          </Stack>
+          <Typography variant="body2" sx={{ mt: 1 }}>
+            {report.nodes_verified.toLocaleString()} file
+            {report.nodes_verified === 1 ? '' : 's'} re-hashed and verified —{' '}
+            {verifiedBackTo}.
+          </Typography>
+        </>
+      ) : (
+        <>
+          <Stack direction="row" gap={1} alignItems="center">
+            <Chip size="small" color="warning" label="partially verified" />
+            <Typography variant="h6" sx={{ fontWeight: 600 }}>
+              No break in the newest {report.nodes_verified.toLocaleString()} files — walk
+              stopped at max_files before completing
+            </Typography>
+          </Stack>
+          <Typography variant="body2" sx={{ mt: 1 }}>
+            Only the walked files are vouched for. Raise max files to walk further back.
+            {report.from_ns !== null && (
+              <>
+                {' '}
+                The walk ran with lower bound {tsPretty(report.from_ns)}; the bound was not
+                reached.
+              </>
+            )}
+          </Typography>
+        </>
       )}
 
-      {(report.truncated || report.history_truncated) && (
-        <Alert severity="warning" sx={{ mt: 1.5 }} data-testid="integrity-truncated">
-          Older windows have aged out of retention — chain verified to the retention
-          horizon, not genesis.
-          {report.truncated && (
-            <> The walk stopped at the max-files bound before completing; raise max files to walk further back.</>
-          )}
-          {report.history_truncated && (
-            <> A node&apos;s recorded supersession history was truncated — rewrites older than the recorded horizon are not individually provable.</>
-          )}
+      {report.history_truncated && (
+        <Alert severity="warning" sx={{ mt: 1.5 }} data-testid="integrity-history-truncated">
+          A node&apos;s recorded supersession history was truncated — rewrites older than
+          the recorded horizon are not individually provable.
         </Alert>
       )}
 
@@ -345,6 +386,9 @@ function VerdictCard({ report }: { report: CustodyVerifyReport }): ReactElement 
           variant="outlined"
           label={report.complete ? 'walk complete' : 'walk incomplete'}
         />
+        {report.truncated && (
+          <Chip size="small" variant="outlined" label="stopped at max_files" />
+        )}
       </Stack>
     </Box>
   );
@@ -357,9 +401,13 @@ function VerifySection(): ReactElement {
   const [fromLocal, setFromLocal] = useState('');
   const [maxFiles, setMaxFiles] = useState(String(MAX_FILES_DEFAULT));
   const [report, setReport] = useState<CustodyVerifyReport | null>(null);
+  const [requestedFromNs, setRequestedFromNs] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+
+  // Don't leave a server-side walk running after the operator navigates away.
+  useEffect(() => () => abortRef.current?.abort(), []);
 
   const { services, failed: servicesFailed } = useServiceNames(true);
 
@@ -379,9 +427,13 @@ function VerifySection(): ReactElement {
         chain_id: chainId.trim(),
         max_files: maxFilesNum,
       };
+      let fromNs: number | null = null;
       if (fromLocal) {
         const ms = new Date(fromLocal).getTime();
-        if (Number.isFinite(ms)) body.from_ns = Math.floor(ms * 1e6);
+        if (Number.isFinite(ms)) {
+          fromNs = Math.floor(ms * 1e6);
+          body.from_ns = fromNs;
+        }
       }
       const r = await fetch(`${API}/v1/custody/verify`, {
         method: 'POST',
@@ -390,7 +442,20 @@ function VerifySection(): ReactElement {
         signal: eitherSignal(ctl.signal, AbortSignal.timeout(VERIFY_TIMEOUT_MS)),
       });
       if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
-      setReport((await r.json()) as CustodyVerifyReport);
+      // Shape sentinel: a proxy error page / wrong service on the port must
+      // land in the error path, never derive a verdict (or crash the route).
+      const parsed = (await r.json()) as Partial<CustodyVerifyReport> | null;
+      if (
+        typeof parsed !== 'object' ||
+        parsed === null ||
+        typeof parsed.complete !== 'boolean' ||
+        typeof parsed.nodes_verified !== 'number' ||
+        !('first_break' in parsed)
+      ) {
+        throw new Error('malformed verify response (wrong service on the port?)');
+      }
+      setRequestedFromNs(fromNs);
+      setReport(parsed as CustodyVerifyReport);
     } catch (e) {
       if (ctl.signal.aborted) setError('Verify cancelled.');
       else setError(String(e));
@@ -493,7 +558,7 @@ function VerifySection(): ReactElement {
 
       {report && (
         <Box sx={{ mt: 2 }}>
-          <VerdictCard report={report} />
+          <VerdictCard report={report} requestedFromNs={requestedFromNs} />
         </Box>
       )}
     </Box>
@@ -509,8 +574,9 @@ export default function IntegrityView(): ReactElement {
         Integrity
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, mb: 1 }}>
-        Chain-of-custody over the raw tier: every flushed file is hash-linked to its
-        predecessor, per service. Walk a chain to prove nothing was altered or removed.
+        Chain-of-custody over the summary tier: every flushed <code>.obsc</code> window is
+        hash-linked to its predecessor, per service. Walk a chain to prove nothing was
+        altered or removed.
       </Typography>
       {/* Honest framing — always visible, whatever the gate says. */}
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2.5 }}>
