@@ -438,13 +438,19 @@ export default function ForesightView(): ReactElement {
   const [whatifBusy, setWhatifBusy] = useState(false);
 
   // One in-flight request at a time: a new run — or any input change —
-  // aborts the previous one (wedge rule: thread AbortController).
+  // aborts the previous one (wedge rule: thread AbortController). Input
+  // changes also clear previous results/errors: stale predictions must
+  // never sit under a new service/range/steps selection.
   const inflight = useRef<AbortController | null>(null);
   useEffect(() => {
     inflight.current?.abort();
     inflight.current = null;
     setForecastBusy(false);
     setWhatifBusy(false);
+    setForecastResp(null);
+    setForecastError(null);
+    setWhatifResp(null);
+    setWhatifError(null);
   }, [service, rangeSecs, steps]);
   useEffect(() => {
     return (): void => inflight.current?.abort();
@@ -452,6 +458,12 @@ export default function ForesightView(): ReactElement {
 
   const beginRequest = (): AbortController => {
     inflight.current?.abort();
+    // The superseded request's finally guard (`inflight.current === ctl`)
+    // goes false the moment the new controller is installed, so it can
+    // never clear its own busy flag — clear BOTH busy flags here; the
+    // caller re-sets its own immediately after.
+    setForecastBusy(false);
+    setWhatifBusy(false);
     const ctl = new AbortController();
     inflight.current = ctl;
     return ctl;

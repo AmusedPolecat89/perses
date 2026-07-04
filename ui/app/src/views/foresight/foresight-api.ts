@@ -119,11 +119,13 @@ export interface ObsescWhatIfResponse {
  */
 function eitherSignal(a: AbortSignal, b: AbortSignal): AbortSignal {
   const ctl = new AbortController();
-  if (a.aborted || b.aborted) ctl.abort();
+  // Forward the originating abort REASON, so the 60s timeout surfaces as
+  // a TimeoutError (not a generic AbortError) in the error state.
+  const forward = (): void => ctl.abort(a.aborted ? a.reason : b.reason);
+  if (a.aborted || b.aborted) forward();
   else {
-    const onAbort = (): void => ctl.abort();
-    a.addEventListener('abort', onAbort, { once: true });
-    b.addEventListener('abort', onAbort, { once: true });
+    a.addEventListener('abort', forward, { once: true });
+    b.addEventListener('abort', forward, { once: true });
   }
   return ctl.signal;
 }
