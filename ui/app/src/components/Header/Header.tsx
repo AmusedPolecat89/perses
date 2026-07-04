@@ -20,6 +20,7 @@ import React from 'react';
 import { useIsLaptopSize, useIsMobileSize } from '../../utils/browser-size';
 import { useIsAuthEnabled } from '../../context/Config';
 import { useOnboarded } from '../../views/onboarding/use-onboarded';
+import { AlertsNavButton } from '../../views/alerts/AlertsNavButton';
 import { projectRoute } from '../../model/project';
 import WhitePersesLogo from '../logo/WhitePersesLogo';
 import PersesLogoCropped from '../logo/PersesLogoCropped';
@@ -111,6 +112,7 @@ export default function Header(): JSX.Element {
               >
                 <CompassOutline sx={{ marginRight: 0.5 }} fontSize="small" /> Explore
               </Button>
+              <AlertsNavButton />
             </>
           )}
         </Box>

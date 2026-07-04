@@ -12,6 +12,8 @@
 // limitations under the License.
 
 export const AdminRoute = '/admin';
+// OBSESC (Lane U1): persisted alert state from GET /v1/alerts.
+export const AlertsRoute = '/alerts';
 export const SignInRoute = '/sign-in';
 export const SignUpRoute = '/sign-up';
 export const DelegatedAuthnErrorRoute = '/delegated-auth-error';

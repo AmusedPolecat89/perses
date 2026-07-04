@@ -31,6 +31,7 @@ import { DarkModeContextProvider } from './context/DarkMode';
 import { NavHistoryProvider } from './context/DashboardNavHistory';
 import {
   AdminRoute,
+  AlertsRoute,
   ConfigRoute,
   DelegatedAuthnErrorRoute,
   ExploreRoute,
@@ -50,6 +51,7 @@ import { PERSES_APP_CONFIG } from './config';
 import { buildRedirectQueryString, useIsLoggedIn, useRedirectQueryParam } from './model/auth/auth-client';
 
 // Other routes are lazy-loaded for code-splitting
+const AlertsView = lazy(() => import('./views/alerts/AlertsView'));
 const NodeManagerView = lazy(() => import('./views/cluster/NodeManagerView'));
 const OnboardingView = lazy(() => import('./views/onboarding/OnboardingView'));
 const ObsescExploreView = lazy(() => import('./views/obsesc-explore/ObsescExploreView'));
@@ -116,6 +118,7 @@ function Router(): ReactElement {
               // to NodeHealth. The Perses home view is a multi-project
               // picker we don't want.
               { index: true, element: <ProjectGuard /> },
+              { path: AlertsRoute, Component: AlertsView },
               { path: 'cluster', Component: NodeManagerView },
               { path: 'onboarding', Component: OnboardingView },
               { path: ProfileRoute, Component: ProfileView },

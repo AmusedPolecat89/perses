@@ -17,6 +17,7 @@ import {
 } from '@mui/material';
 import { NodeStats } from './use-node-stats';
 import { findInstance, monthlyUsd } from './instance-types';
+import { FiringAlertsChip } from '../alerts/FiringAlertsChip';
 
 interface NodeCardProps {
   name: string;
@@ -123,6 +124,10 @@ export function NodeCard({
             ) : (
               <Chip size="small" label="checking…" variant="outlined" />
             )}
+            {/* Lane U1: firing-alert count — alerts are served by THIS
+                node's /obsesc-api, so the chip renders on the local card
+                only (the peer card returns above). */}
+            <FiringAlertsChip />
           </Stack>
           <Typography variant="caption" color="text.secondary">
             {spec ? `${spec.id} · ${spec.vcpu} vCPU / ${spec.memoryGb} GB` : instanceId}{' '}
