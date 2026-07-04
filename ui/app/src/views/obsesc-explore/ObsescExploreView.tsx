@@ -102,7 +102,11 @@ function renderCell(column: string, value: unknown): string {
     const n = Number(s);
     if (Number.isFinite(n) && n > 1e15) return tsPretty(n);
   }
-  if (/^[0-9a-fA-F]+$/.test(s) && s.length >= 8 && s.length % 2 === 0) {
+  // Hex→UTF-8 only applies to STRING values: binary columns (`body`) arrive
+  // hex-encoded as JSON strings, while Int64 columns (`events`, `windows`,
+  // `vcol*_i64`…) arrive as JSON numbers — a pure-digit number like 50505050
+  // would otherwise pass the hex regex and render as "PPPP".
+  if (typeof value === 'string' && /^[0-9a-fA-F]+$/.test(s) && s.length >= 8 && s.length % 2 === 0) {
     try {
       const bytes = new Uint8Array(s.length / 2);
       for (let i = 0; i < bytes.length; i++) {
