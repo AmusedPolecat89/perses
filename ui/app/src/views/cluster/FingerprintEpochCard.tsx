@@ -7,9 +7,10 @@
 //
 // Reads GET /obsesc-api/v1/similar/epoch; "Mint new epoch" opens a real
 // operator-action dialog (POST, scan range ≤ 31 days enforced client-side).
-// The whole card is gated on useCapabilities().similar. A 503 from the mint
-// renders as the designed "artifact/manifest stores not configured" state,
-// never an error toast.
+// Gating is tri-state via useCapabilities(): loading, node-unreachable and
+// capability-disabled each render distinct designed states (mint disabled).
+// A 503 from the mint renders as the designed "artifact/manifest stores not
+// configured" state, never an error toast.
 
 import { ReactElement, useState } from 'react';
 import {
@@ -57,10 +58,33 @@ interface MintEpochResponse {
   manifest_epoch: number;
 }
 
-async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
+/**
+ * `AbortSignal.any([...])` without `AbortSignal.any` (the app's TS lib
+ * target predates it) — same pattern as use-capabilities.ts. Aborts when
+ * EITHER input aborts (react-query's unmount/invalidation signal, or the
+ * timeout).
+ */
+function eitherSignal(a: AbortSignal | undefined, b: AbortSignal): AbortSignal {
+  if (!a) return b;
+  const ctl = new AbortController();
+  const onAbort = (): void => ctl.abort();
+  if (a.aborted || b.aborted) ctl.abort();
+  else {
+    a.addEventListener('abort', onAbort, { once: true });
+    b.addEventListener('abort', onAbort, { once: true });
+  }
+  return ctl.signal;
+}
+
+async function apiFetch(
+  path: string,
+  init?: RequestInit,
+  signal?: AbortSignal
+): Promise<Response> {
   return fetch(`${API}${path}`, {
     ...init,
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    // The timeout applies even when a caller signal is threaded.
+    signal: eitherSignal(signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)),
   });
 }
 
@@ -74,7 +98,7 @@ function toLocalInputValue(d: Date): string {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
-export function FingerprintEpochCard(): ReactElement | null {
+export function FingerprintEpochCard(): ReactElement {
   const caps = useCapabilities();
   const queryClient = useQueryClient();
   const [mintOpen, setMintOpen] = useState(false);
@@ -87,17 +111,16 @@ export function FingerprintEpochCard(): ReactElement | null {
     // the mint mutation invalidates this.
     staleTime: 5 * 60_000,
     retry: 1,
-    queryFn: async () => {
-      const r = await apiFetch('/v1/similar/epoch');
+    queryFn: async ({ signal }) => {
+      const r = await apiFetch('/v1/similar/epoch', undefined, signal);
       if (!r.ok) throw new Error(`GET /v1/similar/epoch: HTTP ${r.status}`);
       return (await r.json()) as EpochStatus;
     },
   });
 
-  // Whole-card gate (task spec): nothing renders unless the node reports
-  // the similarity capability (artifact + manifest stores present).
-  if (!caps.similar) return null;
-
+  // Tri-state gate (standard 4, review fix #2): loading, node-unreachable,
+  // capability-disabled and enabled each render DISTINCT designed states —
+  // the card shell never silently vanishes.
   const epoch = epochQuery.data;
   return (
     <Box
@@ -129,40 +152,71 @@ export function FingerprintEpochCard(): ReactElement | null {
             skipped in similarity results (and counted), never fudged.
           </Typography>
         </Box>
-        <Button variant="outlined" size="small" onClick={() => setMintOpen(true)}>
+        <Button
+          variant="outlined"
+          size="small"
+          disabled={!caps.similar}
+          onClick={() => setMintOpen(true)}
+        >
           Mint new epoch
         </Button>
       </Stack>
 
-      {epochQuery.isLoading && (
+      {/* Capability tri-state: loading ≠ unreachable ≠ disabled. */}
+      {caps.isLoading && (
         <Box sx={{ mt: 2 }}>
           <CircularProgress size={18} />
         </Box>
       )}
-      {epochQuery.isError && (
-        <Alert severity="error" variant="outlined" sx={{ mt: 2 }}>
-          Couldn&apos;t read the epoch status:{' '}
-          {epochQuery.error instanceof Error ? epochQuery.error.message : String(epochQuery.error)}
+      {!caps.isLoading && caps.unavailable && (
+        <Alert severity="warning" variant="outlined" sx={{ mt: 2 }}>
+          Node unreachable — can&apos;t determine whether similarity fingerprints are
+          enabled here. Epoch status will load once the node answers.
+        </Alert>
+      )}
+      {!caps.isLoading && !caps.unavailable && !caps.similar && (
+        <Alert severity="info" variant="outlined" sx={{ mt: 2 }}>
+          Similarity fingerprints not enabled on this node — artifact/manifest stores
+          not configured in config.yaml. Configure both to mint epochs and search
+          for similar windows.
         </Alert>
       )}
 
-      {epoch &&
-        (epoch.loaded ? (
-          <Stack direction="row" gap={4} sx={{ mt: 2, flexWrap: 'wrap' }}>
-            <EpochStat label="epoch id" value={String(epoch.epoch_id ?? '—')} />
-            <EpochStat label="IDF keys" value={String(epoch.idf_entries ?? '—')} />
-            <EpochStat label="windows scanned" value={String(epoch.windows_scanned ?? '—')} />
-            <EpochStat
-              label="template-key version"
-              value={String(epoch.template_key_version ?? '—')}
-            />
-          </Stack>
-        ) : (
-          <Alert severity="info" variant="outlined" sx={{ mt: 2 }}>
-            No projection epoch is loaded on this node — new windows get no fingerprints
-            and similarity search has nothing to compare. Mint one to start.
-          </Alert>
-        ))}
+      {caps.similar && (
+        <>
+          {epochQuery.isLoading && (
+            <Box sx={{ mt: 2 }}>
+              <CircularProgress size={18} />
+            </Box>
+          )}
+          {epochQuery.isError && (
+            <Alert severity="error" variant="outlined" sx={{ mt: 2 }}>
+              Couldn&apos;t read the epoch status:{' '}
+              {epochQuery.error instanceof Error
+                ? epochQuery.error.message
+                : String(epochQuery.error)}
+            </Alert>
+          )}
+
+          {epoch &&
+            (epoch.loaded ? (
+              <Stack direction="row" gap={4} sx={{ mt: 2, flexWrap: 'wrap' }}>
+                <EpochStat label="epoch id" value={String(epoch.epoch_id ?? '—')} />
+                <EpochStat label="IDF keys" value={String(epoch.idf_entries ?? '—')} />
+                <EpochStat label="windows scanned" value={String(epoch.windows_scanned ?? '—')} />
+                <EpochStat
+                  label="template-key version"
+                  value={String(epoch.template_key_version ?? '—')}
+                />
+              </Stack>
+            ) : (
+              <Alert severity="info" variant="outlined" sx={{ mt: 2 }}>
+                No projection epoch is loaded on this node — new windows get no fingerprints
+                and similarity search has nothing to compare. Mint one to start.
+              </Alert>
+            ))}
+        </>
+      )}
 
       <MintEpochDialog
         open={mintOpen}

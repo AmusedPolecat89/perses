@@ -133,7 +133,7 @@ export default function NodeManagerView(): ReactElement {
         </Typography>
       )}
 
-      {/* Lane U4: epoch admin — self-gates on capabilities.similar. */}
+      {/* Lane U4: epoch admin — self-gates (tri-state) on useCapabilities(). */}
       <FingerprintEpochCard />
 
       <ProjectSettings />
