@@ -17,6 +17,7 @@ import { NodeCard } from './NodeCard';
 import { ResizeDialog } from './ResizeDialog';
 import { AddNodeDialog } from './AddNodeDialog';
 import { ProjectSettings } from './ProjectSettings';
+import { FingerprintEpochCard } from './FingerprintEpochCard';
 
 // TODO(β.3.5): once obsesc_node_info{instance_type="…"} is exposed by
 // obsesc-node at boot (pulled from EC2 metadata), read this from
@@ -131,6 +132,9 @@ export default function NodeManagerView(): ReactElement {
           show the cost delta but not yet provision the new instance.
         </Typography>
       )}
+
+      {/* Lane U4: epoch admin — self-gates on capabilities.similar. */}
+      <FingerprintEpochCard />
 
       <ProjectSettings />
 
