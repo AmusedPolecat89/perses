@@ -247,7 +247,9 @@ function InvestigateView(): ReactElement {
     setRunning(false);
   };
 
-  const emptyWindow = error !== null && /404|empty window/i.test(error);
+  // Errors here read "Error: 404: no summary data in the baseline window" —
+  // match the backend's real empty-window text (same fix as DiffDialog).
+  const emptyWindow = error !== null && /: 404: |no summary data/i.test(error);
 
   return (
     <Box sx={{ padding: 3, maxWidth: 1200, margin: '0 auto' }}>
