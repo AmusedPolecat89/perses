@@ -111,8 +111,9 @@ export function useAlerts(
  * exactly the number we want.
  *
  * Returns `null` when the count must not be shown: alerting disabled,
- * capabilities unavailable, still loading, or the count fetch has no
- * answer yet.
+ * capabilities unavailable, still loading, the count fetch has no answer
+ * yet, or the last poll FAILED — react-query retains the previous datum on
+ * error, and a dead node must not keep flashing a stale "N firing".
  */
 export function useFiringAlertCount(): number | null {
   const caps = useCapabilities();
@@ -125,6 +126,6 @@ export function useFiringAlertCount(): number | null {
     queryFn: async ({ signal }) =>
       (await fetchAlerts({ limit: 1, status: 'firing' }, signal)).total,
   });
-  if (!enabled || query.data === undefined) return null;
+  if (!enabled || query.isError || query.data === undefined) return null;
   return query.data;
 }

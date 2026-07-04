@@ -13,13 +13,14 @@
 // instead of faking a settings surface.
 
 import { ReactElement, useMemo, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link as RouterLink, useSearchParams } from 'react-router-dom';
 import {
   Alert,
   Box,
   Button,
   Chip,
   CircularProgress,
+  Link,
   MenuItem,
   Stack,
   Table,
@@ -34,6 +35,7 @@ import {
   Typography,
 } from '@mui/material';
 import { useCapabilities } from '../../hooks/use-capabilities';
+import { dashboardRoute } from '../../model/project';
 import {
   ALERTS_LIMIT_MAX,
   AlertStatus,
@@ -104,9 +106,16 @@ function AlertRow({ alert }: { alert: ObsescAlert }): ReactElement {
         <Chip size="small" variant="outlined" label={alert.predicate} sx={mono} />
       </TableCell>
       <TableCell sx={{ verticalAlign: 'top' }}>
-        <Typography variant="body2" sx={mono}>
+        {/* Pivot to the service-health dashboard (plan: "service links"). */}
+        <Link
+          component={RouterLink}
+          to={dashboardRoute('servicehealth')}
+          underline="hover"
+          variant="body2"
+          sx={mono}
+        >
           {alert.service}
-        </Typography>
+        </Link>
       </TableCell>
       <TableCell align="right" sx={{ verticalAlign: 'top' }}>
         <Typography variant="body2" sx={mono}>
@@ -168,8 +177,8 @@ function UnreachableState(): ReactElement {
       <Typography variant="body2" color="text.secondary" sx={{ mt: 1 }}>
         The OBSESC node did not answer the capability probe, so whether
         alerting is enabled is unknown. Check that the node process is up and
-        that this UI can reach <Box component="code" sx={mono}>/obsesc-api</Box>; the page
-        retries on its own.
+        that this UI can reach <Box component="code" sx={mono}>/obsesc-api</Box>, then
+        reload the page to probe again.
       </Typography>
     </Box>
   );
@@ -218,6 +227,16 @@ export default function AlertsView(): ReactElement {
         </Box>
         {alertsEnabled && (
           <Stack direction="row" alignItems="center" gap={1.5}>
+            {/* Transient poll blip with data on screen: keep the table,
+                flag the staleness — don't blank to the error state. */}
+            {query.isError && query.data !== undefined && (
+              <Chip
+                size="small"
+                color="warning"
+                variant="outlined"
+                label="last refresh failed — showing previous data"
+              />
+            )}
             {query.isFetching && query.data !== undefined && <CircularProgress size={16} />}
             <ToggleButtonGroup
               size="small"
@@ -267,7 +286,7 @@ export default function AlertsView(): ReactElement {
         <UnreachableState />
       ) : !caps.alerting ? (
         <DisabledState />
-      ) : query.isError ? (
+      ) : query.isError && query.data === undefined ? (
         <Alert
           severity="error"
           action={
@@ -311,7 +330,7 @@ export default function AlertsView(): ReactElement {
             </TableHead>
             <TableBody>
               {sorted.map((a) => (
-                <AlertRow key={`${a.rule} ${a.series} ${a.window_start_ns}`} alert={a} />
+                <AlertRow key={`${a.rule}\u0000${a.series}\u0000${a.window_start_ns}`} alert={a} />
               ))}
             </TableBody>
           </Table>
