@@ -84,17 +84,29 @@ function tsPretty(ns: number): string {
 }
 
 /// Render one SQL result cell readably:
+///  - key/identifier columns (`template_key`, `idempotency_key`,
+///    `similar_group`) pass through verbatim — they are opaque identifiers,
+///    never timestamps and never hex-encoded text;
 ///  - binary columns (e.g. `body`) arrive hex-encoded from Arrow JSON —
 ///    decode to UTF-8 when the bytes are valid text;
 ///  - `*_ns` numeric columns pretty-print as timestamps.
 function renderCell(column: string, value: unknown): string {
   if (value == null) return '';
   const s = String(value);
+  // template_keys() emits `template_key` as a u64 DECIMAL string (content
+  // keys live in [2^63, 2^64), 19–20 digits) and `similar_group` as 16 hex
+  // chars — both would trip the hex→UTF-8 heuristic below and a hypothetical
+  // *_key_ns column the timestamp one. Keys render as the exact string.
+  if (/(^|_)key$|^similar_group$/.test(column)) return s;
   if (column.endsWith('_ns')) {
     const n = Number(s);
     if (Number.isFinite(n) && n > 1e15) return tsPretty(n);
   }
-  if (/^[0-9a-fA-F]+$/.test(s) && s.length >= 8 && s.length % 2 === 0) {
+  // Hex→UTF-8 only applies to STRING values: binary columns (`body`) arrive
+  // hex-encoded as JSON strings, while Int64 columns (`events`, `windows`,
+  // `vcol*_i64`…) arrive as JSON numbers — a pure-digit number like 50505050
+  // would otherwise pass the hex regex and render as "PPPP".
+  if (typeof value === 'string' && /^[0-9a-fA-F]+$/.test(s) && s.length >= 8 && s.length % 2 === 0) {
     try {
       const bytes = new Uint8Array(s.length / 2);
       for (let i = 0; i < bytes.length; i++) {
@@ -136,6 +148,21 @@ const SQL_PRESETS: Array<{ label: string; sql: string }> = [
   {
     label: 'one service',
     sql: "SELECT timestamp_ns, body FROM raw_events\nWHERE timestamp_ns >= {NOW_MINUS_1H} AND timestamp_ns < {NOW}\n  AND service = 'svc-b'\nLIMIT 20",
+  },
+  // Virtual columns (Lane H): template_keys(service, from_ns, to_ns) lists
+  // every TemplateKey observed in the window (summary tier only — no raw
+  // scan); template_events(service, template_key, from_ns, to_ns) re-matches
+  // raw bodies against that template's pattern and exposes each <*> position
+  // as vcol{i} (+ vcol{i}_i64 / vcol{i}_f64 typed companions). The key is a
+  // u64 passed as a string literal (decimal or 0x-hex), exactly as
+  // template_keys() prints it. Both are capped server-side at a 7-day window.
+  {
+    label: 'template keys',
+    sql: "SELECT template_key, pattern, events, windows, wildcards, similar_group\nFROM template_keys('svc-000', {NOW_MINUS_1H}, {NOW})\nLIMIT 50",
+  },
+  {
+    label: 'template events',
+    sql: "-- paste a template_key from the 'template keys' preset\nSELECT * FROM template_events('svc-000', '<template_key>', {NOW_MINUS_1H}, {NOW})\nLIMIT 20",
   },
 ];
 
