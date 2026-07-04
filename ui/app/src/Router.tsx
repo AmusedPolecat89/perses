@@ -37,6 +37,7 @@ import {
   ExploreRoute,
   ForesightRoute,
   ImportRoute,
+  IntegrityRoute,
   InvestigateRoute,
   ProfileRoute,
   ProjectRoute,
@@ -59,6 +60,7 @@ const OnboardingView = lazy(() => import('./views/onboarding/OnboardingView'));
 const ObsescExploreView = lazy(() => import('./views/obsesc-explore/ObsescExploreView'));
 const ForesightView = lazy(() => import('./views/foresight/ForesightView'));
 const InvestigateView = lazy(() => import('./views/investigate/InvestigateView'));
+const IntegrityView = lazy(() => import('./views/integrity/IntegrityView'));
 const ImportView = lazy(() => import('./views/import/ImportView'));
 const AdminView = lazy(() => import('./views/admin/AdminView'));
 const ConfigView = lazy(() => import('./views/config/ConfigView'));
@@ -151,6 +153,8 @@ function Router(): ReactElement {
                 path: InvestigateRoute,
                 Component: InvestigateView,
               },
+              // OBSESC Lane U6: custody-chain verification (/v1/custody/verify).
+              { path: IntegrityRoute, Component: IntegrityView },
               {
                 path: ProjectRoute,
                 element: <GuardedProjectRoute />,

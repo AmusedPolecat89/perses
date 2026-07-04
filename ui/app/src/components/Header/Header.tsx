@@ -18,6 +18,7 @@ import RocketLaunchOutline from 'mdi-material-ui/RocketLaunchOutline';
 import CompassOutline from 'mdi-material-ui/CompassOutline';
 import CrystalBall from 'mdi-material-ui/CrystalBall';
 import CompareHorizontal from 'mdi-material-ui/CompareHorizontal';
+import ShieldCheckOutline from 'mdi-material-ui/ShieldCheckOutline';
 import React from 'react';
 import { useIsLaptopSize, useIsMobileSize } from '../../utils/browser-size';
 import { useIsAuthEnabled } from '../../context/Config';
@@ -133,6 +134,16 @@ export default function Header(): JSX.Element {
                 sx={{ marginLeft: 0.5 }}
               >
                 <CompareHorizontal sx={{ marginRight: 0.5 }} fontSize="small" /> Investigate
+              </Button>
+              {/* OBSESC Lane U6: custody-chain verification */}
+              <Button
+                aria-label="Integrity"
+                color="inherit"
+                component={RouterLink}
+                to="/integrity"
+                sx={{ marginLeft: 0.5 }}
+              >
+                <ShieldCheckOutline sx={{ marginRight: 0.5 }} fontSize="small" /> Integrity
               </Button>
             </>
           )}

@@ -24,4 +24,5 @@ export const ExploreRoute = '/explore';
 export const ForesightRoute = '/foresight';
 // OBSESC Lane U3: differential forensics (diff-vs-baseline).
 export const InvestigateRoute = '/investigate';
+export const IntegrityRoute = '/integrity';
 export const ProfileRoute = '/profile';
