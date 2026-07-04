@@ -16,6 +16,7 @@ import { AppBar, Badge, Box, Button, Toolbar } from '@mui/material';
 import ServerNetwork from 'mdi-material-ui/ServerNetwork';
 import RocketLaunchOutline from 'mdi-material-ui/RocketLaunchOutline';
 import CompassOutline from 'mdi-material-ui/CompassOutline';
+import CrystalBall from 'mdi-material-ui/CrystalBall';
 import React from 'react';
 import { useIsLaptopSize, useIsMobileSize } from '../../utils/browser-size';
 import { useIsAuthEnabled } from '../../context/Config';
@@ -113,6 +114,15 @@ export default function Header(): JSX.Element {
                 <CompassOutline sx={{ marginRight: 0.5 }} fontSize="small" /> Explore
               </Button>
               <AlertsNavButton />
+              <Button
+                aria-label="Foresight"
+                color="inherit"
+                component={RouterLink}
+                to="/foresight"
+                sx={{ marginLeft: 0.5 }}
+              >
+                <CrystalBall sx={{ marginRight: 0.5 }} fontSize="small" /> Foresight
+              </Button>
             </>
           )}
         </Box>

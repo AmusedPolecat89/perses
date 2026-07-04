@@ -35,6 +35,7 @@ import {
   ConfigRoute,
   DelegatedAuthnErrorRoute,
   ExploreRoute,
+  ForesightRoute,
   ImportRoute,
   ProfileRoute,
   ProjectRoute,
@@ -55,6 +56,7 @@ const AlertsView = lazy(() => import('./views/alerts/AlertsView'));
 const NodeManagerView = lazy(() => import('./views/cluster/NodeManagerView'));
 const OnboardingView = lazy(() => import('./views/onboarding/OnboardingView'));
 const ObsescExploreView = lazy(() => import('./views/obsesc-explore/ObsescExploreView'));
+const ForesightView = lazy(() => import('./views/foresight/ForesightView'));
 const ImportView = lazy(() => import('./views/import/ImportView'));
 const AdminView = lazy(() => import('./views/admin/AdminView'));
 const ConfigView = lazy(() => import('./views/config/ConfigView'));
@@ -139,6 +141,8 @@ function Router(): ReactElement {
                 path: ExploreRoute,
                 Component: ObsescExploreView,
               },
+              // OBSESC Lane U5: world-model surface (forecast + what-if).
+              { path: ForesightRoute, Component: ForesightView },
               {
                 path: ProjectRoute,
                 element: <GuardedProjectRoute />,

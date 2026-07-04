@@ -21,4 +21,5 @@ export const ConfigRoute = '/config';
 export const ImportRoute = '/import';
 export const ProjectRoute = '/projects';
 export const ExploreRoute = '/explore';
+export const ForesightRoute = '/foresight';
 export const ProfileRoute = '/profile';
