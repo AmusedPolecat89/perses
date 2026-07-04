@@ -35,6 +35,7 @@ import {
   DelegatedAuthnErrorRoute,
   ExploreRoute,
   ImportRoute,
+  IntegrityRoute,
   ProfileRoute,
   ProjectRoute,
   SignInRoute,
@@ -53,6 +54,7 @@ import { buildRedirectQueryString, useIsLoggedIn, useRedirectQueryParam } from '
 const NodeManagerView = lazy(() => import('./views/cluster/NodeManagerView'));
 const OnboardingView = lazy(() => import('./views/onboarding/OnboardingView'));
 const ObsescExploreView = lazy(() => import('./views/obsesc-explore/ObsescExploreView'));
+const IntegrityView = lazy(() => import('./views/integrity/IntegrityView'));
 const ImportView = lazy(() => import('./views/import/ImportView'));
 const AdminView = lazy(() => import('./views/admin/AdminView'));
 const ConfigView = lazy(() => import('./views/config/ConfigView'));
@@ -136,6 +138,7 @@ function Router(): ReactElement {
                 path: ExploreRoute,
                 Component: ObsescExploreView,
               },
+              { path: IntegrityRoute, Component: IntegrityView },
               {
                 path: ProjectRoute,
                 element: <GuardedProjectRoute />,
