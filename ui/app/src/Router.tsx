@@ -37,6 +37,7 @@ import {
   ExploreRoute,
   ForesightRoute,
   ImportRoute,
+  InvestigateRoute,
   ProfileRoute,
   ProjectRoute,
   SignInRoute,
@@ -57,6 +58,7 @@ const NodeManagerView = lazy(() => import('./views/cluster/NodeManagerView'));
 const OnboardingView = lazy(() => import('./views/onboarding/OnboardingView'));
 const ObsescExploreView = lazy(() => import('./views/obsesc-explore/ObsescExploreView'));
 const ForesightView = lazy(() => import('./views/foresight/ForesightView'));
+const InvestigateView = lazy(() => import('./views/investigate/InvestigateView'));
 const ImportView = lazy(() => import('./views/import/ImportView'));
 const AdminView = lazy(() => import('./views/admin/AdminView'));
 const ConfigView = lazy(() => import('./views/config/ConfigView'));
@@ -143,6 +145,12 @@ function Router(): ReactElement {
               },
               // OBSESC Lane U5: world-model surface (forecast + what-if).
               { path: ForesightRoute, Component: ForesightView },
+              // OBSESC Lane U3: differential forensics — diff a broken
+              // window against a healthy baseline (/v1/diff).
+              {
+                path: InvestigateRoute,
+                Component: InvestigateView,
+              },
               {
                 path: ProjectRoute,
                 element: <GuardedProjectRoute />,
