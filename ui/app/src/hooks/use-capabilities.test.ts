@@ -43,19 +43,32 @@ describe('toCapabilitiesState', () => {
     expect(caps.cluster).toEqual({ enabled: true, routing: 'arrival' });
   });
 
-  it('degrades malformed bodies to the all-disabled shape (never throws)', () => {
-    for (const garbage of [null, undefined, 'error page', 42, [], {}]) {
-      const caps = toCapabilitiesState(garbage);
-      expect(caps.preview).toBe(false);
-      expect(caps.sql).toBe(false);
-      expect(caps.crosstab).toEqual({ enabled: false, pairs: [] });
-      expect(caps.cluster).toEqual({ enabled: false, routing: 'owner' });
+  it('treats malformed bodies as FAILURES (throws), never as "all disabled"', () => {
+    // Review fix #1: a proxy/wrong-service JSON body must surface as
+    // `unavailable: true` via the hook's error path — NOT cache as a
+    // valid everything-off answer for the full staleTime. The parser
+    // throws; react-query then retries it like any network error, and
+    // the hook returns DISABLED_CAPABILITIES (unavailable: true).
+    for (const garbage of [
+      null,
+      undefined,
+      'error page',
+      42,
+      [],
+      {},
+      { message: 'not found' },
+      { crosstab: 'nope', cluster: 7 },
+      { preview: 'yes' }, // preview must be a boolean, not truthy junk
+    ]) {
+      expect(() => toCapabilitiesState(garbage)).toThrow(/malformed capabilities/);
     }
-    // A wrong-shaped-but-object body must not throw either.
-    expect(toCapabilitiesState({ crosstab: 'nope', cluster: 7 }).crosstab.pairs).toEqual([]);
-    // Malformed pair entries are filtered, valid ones kept.
+    // The shape every malformed body ends up rendered as:
+    expect(DISABLED_CAPABILITIES.unavailable).toBe(true);
+    // Within a shape-valid body, malformed pair ENTRIES are filtered and
+    // valid ones kept (partial degradation, not failure).
     expect(
       toCapabilitiesState({
+        preview: true,
         crosstab: { enabled: true, pairs: [{ row: 'template', col: 'level' }, 'junk', { row: 1 }] },
       }).crosstab.pairs
     ).toEqual([{ row: 'template', col: 'level' }]);

@@ -86,13 +86,25 @@ function eitherSignal(a: AbortSignal | undefined, b: AbortSignal): AbortSignal {
 }
 
 /**
- * Coerce a parsed response body into the capability shape, defensively:
- * a malformed body (proxy error page, wrong service on the port) must
- * degrade to all-disabled + unavailable, never throw into a view.
+ * Coerce a parsed response body into the capability shape. A shape miss
+ * (proxy error page, wrong service on the port, JSON error body) is a
+ * FAILURE — it throws so react-query treats it exactly like a network
+ * error (retry, error-state, no fresh-for-staleTime caching) and the
+ * hook maps it to all-disabled + `unavailable: true`. It must never
+ * masquerade as a valid "everything disabled" answer (review fix #1).
  * Exported for unit tests.
  */
 export function toCapabilitiesState(body: unknown): CapabilitiesState {
-  if (typeof body !== 'object' || body === null) return DISABLED_CAPABILITIES;
+  // `preview` is always true on a real response, so its presence as a
+  // boolean is the cheapest honest shape sentinel.
+  if (
+    typeof body !== 'object' ||
+    body === null ||
+    Array.isArray(body) ||
+    typeof (body as Record<string, unknown>).preview !== 'boolean'
+  ) {
+    throw new Error('malformed capabilities response (wrong service on the port?)');
+  }
   const b = body as Record<string, unknown>;
   const bool = (v: unknown): boolean => v === true;
   const crosstab = (typeof b.crosstab === 'object' && b.crosstab !== null
