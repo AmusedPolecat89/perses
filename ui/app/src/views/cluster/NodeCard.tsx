@@ -6,22 +6,17 @@
 // action button.
 
 import { ReactElement } from 'react';
-import {
-  Box,
-  Button,
-  Chip,
-  LinearProgress,
-  Stack,
-  Tooltip,
-  Typography,
-} from '@mui/material';
+import { Box, Button, Chip, LinearProgress, Stack, Tooltip, Typography } from '@mui/material';
+import { FiringAlertsChip } from '../alerts/FiringAlertsChip';
 import { NodeStats } from './use-node-stats';
 import { findInstance, monthlyUsd } from './instance-types';
-import { FiringAlertsChip } from '../alerts/FiringAlertsChip';
 
 interface NodeCardProps {
   name: string;
   instanceId: string;
+  /// True when instanceId is a fallback guess (obsesc_node_info absent from
+  /// /metrics) — the card labels the size and price "estimated".
+  instanceEstimated?: boolean;
   stats: NodeStats | undefined;
   isLoading: boolean;
   error: unknown;
@@ -29,7 +24,9 @@ interface NodeCardProps {
   /// browser session — renders a membership card with the advertised addr
   /// instead of live gauges.
   peerAddr?: string;
-  onResize: () => void;
+  /// Omitted → no resize affordance (read-only presentation while the
+  /// cluster capability is off/unknown).
+  onResize?: () => void;
 }
 
 function bytesPretty(n: number): string {
@@ -58,6 +55,7 @@ function budgetColor(pct: number): 'success' | 'warning' | 'error' {
 export function NodeCard({
   name,
   instanceId,
+  instanceEstimated = false,
   stats,
   isLoading,
   error,
@@ -93,8 +91,7 @@ export function NodeCard({
           peer · {peerAddr || 'no advertised address'}
         </Typography>
         <Typography variant="body2" color="text.secondary" sx={{ mt: 2 }}>
-          In the ring at the current epoch. Open this node&apos;s own dashboard for
-          its live gauges.
+          In the ring at the current epoch. Open this node&apos;s own dashboard for its live gauges.
         </Typography>
       </Box>
     );
@@ -132,11 +129,14 @@ export function NodeCard({
           <Typography variant="caption" color="text.secondary">
             {spec ? `${spec.id} · ${spec.vcpu} vCPU / ${spec.memoryGb} GB` : instanceId}{' '}
             {spec && `· approx $${monthlyUsd(spec).toFixed(0)}/mo`}
+            {instanceEstimated && ' · estimated — node doesn’t report its type'}
           </Typography>
         </Box>
-        <Button variant="outlined" size="small" onClick={onResize}>
-          → Resize
-        </Button>
+        {onResize && (
+          <Button variant="outlined" size="small" onClick={onResize}>
+            → Resize
+          </Button>
+        )}
       </Stack>
 
       <Box sx={{ mt: 2 }}>
@@ -214,17 +214,13 @@ export function NodeCard({
           <Typography variant="overline" color="text.secondary">
             Dispatch lag
           </Typography>
-          <Typography variant="body2">
-            {stats ? `${(stats.dispatchLag.ratio * 100).toFixed(2)}%` : '—'}
-          </Typography>
+          <Typography variant="body2">{stats ? `${(stats.dispatchLag.ratio * 100).toFixed(2)}%` : '—'}</Typography>
         </Box>
         <Box>
           <Typography variant="overline" color="text.secondary">
             WAL shards
           </Typography>
-          <Typography variant="body2">
-            {stats?.walShards.length ? `${stats.walShards.length} active` : '—'}
-          </Typography>
+          <Typography variant="body2">{stats?.walShards.length ? `${stats.walShards.length} active` : '—'}</Typography>
         </Box>
         <Box>
           <Typography variant="overline" color="text.secondary">

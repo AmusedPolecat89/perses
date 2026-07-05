@@ -33,6 +33,12 @@ export interface NodeStats {
   dispatchLag: { items: number; capacity: number; ratio: number };
   // Cumulative S3 PUT errors from the raw writer.
   s3PutErrors: number;
+  // From obsesc_node_info{instance_type,role} 1 (control-plane nodes).
+  // null on older nodes that don't export it — callers fall back to an
+  // estimate and must LABEL it as such.
+  instanceType: string | null;
+  // From obsesc_node_info{role} — 'ingest' | 'query' | 'all' on the wire.
+  nodeRole: string | null;
   // Raw text for the troubleshooting modal.
   rawMetrics: string;
 }
@@ -54,6 +60,8 @@ function parsePrometheus(text: string): NodeStats {
     summaryBucketsOpen: 0,
     dispatchLag: { items: 0, capacity: 0, ratio: 0 },
     s3PutErrors: 0,
+    instanceType: null,
+    nodeRole: null,
     rawMetrics: text,
   };
   const budgetCurrent: Record<string, number> = {};
@@ -121,6 +129,11 @@ function parsePrometheus(text: string): NodeStats {
       case 'obsesc_s3_put_errors_total':
         stats.s3PutErrors = value;
         break;
+      case 'obsesc_node_info':
+        // Info-style metric: labels carry the payload, value is always 1.
+        if (labels.instance_type) stats.instanceType = labels.instance_type;
+        if (labels.role) stats.nodeRole = labels.role;
+        break;
     }
   }
 
@@ -144,10 +157,7 @@ export function useNodeStats(refetchIntervalMs = 5_000): UseQueryResult<NodeStat
     queryKey: ['obsesc-node-stats'],
     refetchInterval: refetchIntervalMs,
     queryFn: async () => {
-      const [healthRes, metricsRes] = await Promise.all([
-        fetch(HEALTH_URL),
-        fetch(METRICS_URL),
-      ]);
+      const [healthRes, metricsRes] = await Promise.all([fetch(HEALTH_URL), fetch(METRICS_URL)]);
       if (!metricsRes.ok) {
         throw new Error(`metrics fetch failed: HTTP ${metricsRes.status}`);
       }
