@@ -20,7 +20,13 @@ const ACTION_META: Record<ActivityAction, { label: string; Icon: typeof RocketLa
   terminate: { label: 'terminate', Icon: PowerPlugOff },
 };
 
-export function ActivityFeedCard({ enabled }: { enabled: boolean }): ReactElement {
+interface ActivityFeedCardProps {
+  enabled: boolean;
+  /** Capabilities probe still in flight — "not enabled" isn't known yet. */
+  capsLoading?: boolean;
+}
+
+export function ActivityFeedCard({ enabled, capsLoading = false }: ActivityFeedCardProps): ReactElement {
   const { data: events, isLoading, error } = useClusterActivity(enabled);
 
   return (
@@ -41,7 +47,12 @@ export function ActivityFeedCard({ enabled }: { enabled: boolean }): ReactElemen
         Node launches, drains and removals — newest first, with each action&apos;s approximate monthly cost impact.
       </Typography>
 
-      {!enabled && (
+      {!enabled && capsLoading && (
+        <Box sx={{ mt: 2 }}>
+          <CircularProgress size={18} />
+        </Box>
+      )}
+      {!enabled && !capsLoading && (
         <Typography variant="body2" color="text.secondary" sx={{ mt: 2 }}>
           Available once the cluster control plane is enabled on this node.
         </Typography>

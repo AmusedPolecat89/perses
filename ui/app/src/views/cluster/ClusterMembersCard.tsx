@@ -25,7 +25,13 @@ import { DrainProgress } from './DrainProgress';
 export interface PendingLaunch {
   instanceId: string;
   instanceType: string;
+  /** When the 202 was accepted — drives the honest "overdue" degradation. */
+  atMs: number;
 }
+
+/** A launch that hasn't joined after this long deserves a warning, not a
+ * perpetually optimistic "launching…" row. */
+const LAUNCH_OVERDUE_MS = 5 * 60_000;
 
 interface ClusterMembersCardProps {
   cluster: ClusterView;
@@ -153,7 +159,18 @@ export function ClusterMembersCard({
                 </Typography>
               </TableCell>
               <TableCell>
-                <Chip size="small" variant="outlined" label="launching…" />
+                {Date.now() - pendingLaunch.atMs > LAUNCH_OVERDUE_MS ? (
+                  // Re-evaluated on every membership poll tick — honest
+                  // degradation instead of a forever-optimistic row.
+                  <Stack direction="row" alignItems="center" gap={1}>
+                    <Chip size="small" variant="outlined" color="warning" label="launching…" />
+                    <Typography variant="caption" sx={{ color: 'warning.main' }}>
+                      not joined after 5 min — check the activity feed / EC2 console
+                    </Typography>
+                  </Stack>
+                ) : (
+                  <Chip size="small" variant="outlined" label="launching…" />
+                )}
               </TableCell>
               {actionsEnabled && <TableCell />}
             </TableRow>

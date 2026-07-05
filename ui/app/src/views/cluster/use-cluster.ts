@@ -144,9 +144,12 @@ function toClusterNode(n: unknown): ClusterNode {
 }
 
 /**
- * Live membership. `null` = endpoint absent (older node) → the view falls
- * back to the single local card. Pass a faster interval while a launch is
- * pending so the self-join shows up promptly.
+ * Live membership. `null` = endpoint ABSENT (404 from an older node) → the
+ * view falls back to the single local card. Any OTHER failure (5xx, 401,
+ * network) throws so the view can render a visible outage state — a
+ * control-plane outage must never masquerade as a healthy single-node
+ * deployment. Pass a faster interval while a launch is pending so the
+ * self-join shows up promptly.
  */
 export function useClusterView(refetchIntervalMs = 10_000): UseQueryResult<ClusterView | null> {
   return useQuery<ClusterView | null>({
@@ -155,7 +158,8 @@ export function useClusterView(refetchIntervalMs = 10_000): UseQueryResult<Clust
     retry: false,
     queryFn: async ({ signal }) => {
       const res = await apiFetch('/v1/cluster', undefined, signal);
-      if (!res.ok) return null; // older node / endpoint absent → fallback
+      if (res.status === 404) return null; // older node / endpoint absent → fallback
+      if (!res.ok) throw new Error(`GET /v1/cluster: HTTP ${res.status}`);
       const body = (await res.json()) as Record<string, unknown>;
       return {
         enabled: body.enabled === true,
@@ -210,6 +214,8 @@ function useInvalidateCluster(): () => void {
   return () => {
     void queryClient.invalidateQueries({ queryKey: CLUSTER_QUERY_KEY });
     void queryClient.invalidateQueries({ queryKey: ACTIVITY_QUERY_KEY });
+    // Node count changed → every cached before/after preview is stale.
+    void queryClient.invalidateQueries({ queryKey: ['obsesc-cluster-cost-preview'] });
   };
 }
 
@@ -256,7 +262,9 @@ export function useDrainStatus(nodeId: string, enabled: boolean): UseQueryResult
   return useQuery<DrainStatus>({
     queryKey: ['obsesc-cluster-drain', nodeId],
     enabled,
-    refetchInterval: (data) => (data?.status === 'draining' ? 2_000 : false),
+    // Keep polling while the caller shows the surface — 'active' can mean
+    // the drain hasn't registered yet, and only 'drained' is terminal.
+    refetchInterval: (data) => (data?.status === 'drained' ? false : 2_000),
     retry: false,
     queryFn: async ({ signal }) => {
       const r = await apiFetch(`/v1/cluster/nodes/${encodeURIComponent(nodeId)}/drain`, undefined, signal);

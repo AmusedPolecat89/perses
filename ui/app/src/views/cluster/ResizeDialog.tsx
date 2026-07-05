@@ -42,6 +42,33 @@ import { CostPreviewBox } from './CostPreviewBox';
 import { DrainProgress } from './DrainProgress';
 import { usdDeltaPretty } from './format';
 
+/**
+ * Mid-flow memory, keyed by the OLD node's id. Module-scoped (same pattern
+ * as use-node-stats' prevCommitted) so closing and reopening the dialog
+ * resumes from the recorded flow state instead of re-offering a live
+ * "Launch replacement" button — the double-launch/double-cost footgun.
+ * The baseline snapshot also lets a MANUALLY launched replacement
+ * (provision=false) advance the stepper: any member that wasn't in the
+ * ring when the flow first opened counts as the replacement having joined.
+ * Cleared when the flow completes (old node removed).
+ */
+interface ResizeFlow {
+  /** Member ids when this flow first opened. */
+  baselineIds: string[];
+  launched: { instanceId: string; nodesAtLaunch: number } | null;
+}
+const resizeFlows = new Map<string, ResizeFlow>();
+
+function getResizeFlow(nodeId: string, nodes: ClusterNode[]): ResizeFlow {
+  const existing = resizeFlows.get(nodeId);
+  if (existing) return existing;
+  const created: ResizeFlow = { baselineIds: nodes.map((n) => n.id), launched: null };
+  // Don't persist a baseline off an empty/still-loading membership snapshot —
+  // it would make every later member look like "the replacement joined".
+  if (nodes.length > 0) resizeFlows.set(nodeId, created);
+  return created;
+}
+
 interface ResizeDialogProps {
   open: boolean;
   onClose: () => void;
@@ -70,23 +97,36 @@ export function ResizeDialog({
   onLaunched,
 }: ResizeDialogProps): ReactElement {
   const [targetType, setTargetType] = useState<string>('c7i.4xlarge');
-  const [launched, setLaunched] = useState<{ instanceId: string; nodesAtLaunch: number } | null>(null);
+  // Restore any mid-flow state recorded for this node (close/reopen safe).
+  const flow = getResizeFlow(node.id, nodes);
+  const [launched, setLaunchedState] = useState<ResizeFlow['launched']>(flow.launched);
+  const setLaunched = (l: ResizeFlow['launched']): void => {
+    flow.launched = l;
+    setLaunchedState(l);
+  };
 
   const oldSpec: InstanceSpec | undefined = currentInstanceType ? findInstance(currentInstanceType) : undefined;
   const newSpec = findInstance(targetType);
 
-  const preview = useCostPreview({ action: 'add', instance_type: targetType }, open && launched === null);
   const launch = useAddNode();
   const startDrain = useStartDrain();
   const remove = useRemoveNode();
 
-  // Step 1 completes when the replacement self-joins: its instance id shows
-  // up as a member (contract assumption: node id == EC2 instance id), or —
-  // fallback — membership simply grew since the launch.
-  const joined =
+  // Step 1 completes from OBSERVABLE state, not just the launch mutation:
+  //  - the launched instance id shows up as a member (contract assumption:
+  //    node id == EC2 instance id), or membership grew since the launch;
+  //  - a member appears that wasn't in the ring when this flow opened —
+  //    the manually-launched replacement path (provision=false);
+  //  - the old node is already draining/removed (later steps ran), which
+  //    also makes a reopened dialog resume at the right step.
+  const launchJoined =
     launched !== null && (nodes.some((n) => n.id === launched.instanceId) || nodes.length > launched.nodesAtLaunch);
+  const manualJoined = nodes.some((n) => n.id !== node.id && !flow.baselineIds.includes(n.id));
   const drainStarted = node.status === 'draining' || startDrain.isSuccess;
   const removed = remove.isSuccess;
+  const joined = launchJoined || manualJoined || drainStarted || removed;
+
+  const preview = useCostPreview({ action: 'add', instance_type: targetType }, open && launched === null && !joined);
   // The step only advances past "drain" when the SERVER says drained.
   const drainQuery = useDrainStatus(node.id, open && drainStarted && !removed);
   const drained = drainQuery.data?.status === 'drained';
@@ -268,7 +308,14 @@ export function ResizeDialog({
                       variant="contained"
                       color="error"
                       disabled={remove.isLoading}
-                      onClick={() => remove.mutate({ nodeId: node.id, terminate: provision, force: false })}
+                      onClick={() =>
+                        remove.mutate(
+                          { nodeId: node.id, terminate: provision, force: false },
+                          // Flow complete — forget the mid-flow memory so a
+                          // future resize of a same-named node starts fresh.
+                          { onSuccess: () => resizeFlows.delete(node.id) }
+                        )
+                      }
                     >
                       Remove{provision ? ' + terminate' : ''} {node.id}
                     </Button>

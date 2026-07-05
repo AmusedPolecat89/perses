@@ -47,10 +47,11 @@ export function RemoveNodeDialog({ open, onClose, node, provision }: RemoveNodeD
   const preview = useCostPreview({ action: 'remove', node_id: node.id }, open);
   const startDrain = useStartDrain();
   // Track the drain whenever the node is mid-lifecycle (not before the
-  // operator acts, and not needlessly after removal).
-  const drainVisible = open && (node.status === 'draining' || startDrain.isSuccess || node.status === 'down');
-  const drain = useDrainStatus(node.id, drainVisible && node.status !== 'down');
+  // operator acts, and not once the node is removed or down).
   const remove = useRemoveNode();
+  const drainVisible =
+    open && !remove.isSuccess && (node.status === 'draining' || startDrain.isSuccess || node.status === 'down');
+  const drain = useDrainStatus(node.id, drainVisible && node.status !== 'down');
 
   const isDown = node.status === 'down';
   const drained = drain.data?.status === 'drained';
@@ -114,7 +115,7 @@ export function RemoveNodeDialog({ open, onClose, node, provision }: RemoveNodeD
               Drain failed to start: {startDrain.error.message}
             </Alert>
           )}
-          {draining && !isDown && <DrainProgress nodeId={node.id} enabled={drainVisible} />}
+          {draining && !isDown && !remove.data && <DrainProgress nodeId={node.id} enabled={drainVisible} />}
 
           {isDown && (
             <>

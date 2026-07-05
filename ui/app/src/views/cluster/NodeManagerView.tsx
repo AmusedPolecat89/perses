@@ -15,7 +15,7 @@
 // before commit — no AWS console hand-offs.
 
 import { ReactElement, useEffect, useMemo, useState } from 'react';
-import { Box, Button, Chip, Stack, Tooltip, Typography } from '@mui/material';
+import { Alert, Box, Button, Chip, Stack, Tooltip, Typography } from '@mui/material';
 import { useCapabilities } from '../../hooks/use-capabilities';
 import { useNodeStats } from './use-node-stats';
 import { NodeCard } from './NodeCard';
@@ -46,9 +46,13 @@ export default function NodeManagerView(): ReactElement {
   const [nodesAtLaunch, setNodesAtLaunch] = useState(0);
   // Poll membership fast while a launch is in flight so the self-join
   // (epoch advance + new member) shows up promptly.
-  const { data: cluster } = useClusterView(pendingLaunch ? 3_000 : 10_000);
+  const { data: cluster, error: clusterError } = useClusterView(pendingLaunch ? 3_000 : 10_000);
   const [resizeTargetId, setResizeTargetId] = useState<string | null>(null);
-  const [removeTargetId, setRemoveTargetId] = useState<string | null>(null);
+  // The remove target is SNAPSHOTTED at open: a successful removal drops
+  // the node from /v1/cluster on the next refetch, and the dialog must
+  // stay up showing the "Removed X / terminated" confirmation until the
+  // operator dismisses it (live status still overrides while it exists).
+  const [removeSnapshot, setRemoveSnapshot] = useState<ClusterNode | null>(null);
   const [addOpen, setAddOpen] = useState(false);
 
   // Tri-state capability gate (standard #4): actions only render once the
@@ -69,7 +73,7 @@ export default function NodeManagerView(): ReactElement {
 
   const onLaunched = (instanceId: string, instanceType: string): void => {
     setNodesAtLaunch(nodes.length);
-    setPendingLaunch({ instanceId, instanceType });
+    setPendingLaunch({ instanceId, instanceType, atMs: Date.now() });
   };
 
   const clusterLive = cluster?.enabled === true && nodes.length > 0;
@@ -85,7 +89,12 @@ export default function NodeManagerView(): ReactElement {
       ? // Fallback when /v1/cluster is absent: a synthetic single-node member.
         { id: resizeTargetId, addr: '', role: stats?.nodeRole ?? 'all', status: 'active' }
       : null);
-  const removeTarget: ClusterNode | null = nodes.find((n) => n.id === removeTargetId) ?? null;
+  // Live membership overrides the snapshot while the node still exists, so
+  // draining→drained transitions flow in; after removal the snapshot keeps
+  // the dialog (and its confirmation) mounted.
+  const removeTarget: ClusterNode | null = removeSnapshot
+    ? (nodes.find((n) => n.id === removeSnapshot.id) ?? removeSnapshot)
+    : null;
 
   return (
     <Box sx={{ padding: 3, maxWidth: 1280, mx: 'auto' }}>
@@ -141,8 +150,18 @@ export default function NodeManagerView(): ReactElement {
           pendingLaunch={pendingLaunch}
           actionsEnabled={actionsEnabled}
           onResize={(node) => setResizeTargetId(node.id)}
-          onRemove={(node) => setRemoveTargetId(node.id)}
+          onRemove={(node) => setRemoveSnapshot(node)}
         />
+      )}
+
+      {/* /v1/cluster failing is an OUTAGE, not a single-node deployment —
+          say so instead of quietly falling back (the 404 fallback above is
+          only for older nodes without the endpoint). */}
+      {clusterError !== null && clusterError !== undefined && (
+        <Alert severity="warning" variant="outlined" sx={{ mt: 2 }}>
+          Cluster membership unavailable — {clusterError instanceof Error ? clusterError.message : String(clusterError)}
+          . Retrying; member list and lifecycle actions return once /v1/cluster answers.
+        </Alert>
       )}
 
       {/* This node's live gauges (peers are reached via their own UIs). */}
@@ -171,7 +190,7 @@ export default function NodeManagerView(): ReactElement {
       )}
 
       {/* Operator audit trail (launch / drain / remove / terminate). */}
-      <ActivityFeedCard enabled={actionsEnabled} />
+      <ActivityFeedCard enabled={actionsEnabled} capsLoading={caps.isLoading} />
 
       {/* Lane U4: epoch admin — self-gates (tri-state) on useCapabilities(). */}
       <FingerprintEpochCard />
@@ -190,7 +209,7 @@ export default function NodeManagerView(): ReactElement {
         />
       )}
       {removeTarget && (
-        <RemoveNodeDialog open onClose={() => setRemoveTargetId(null)} node={removeTarget} provision={provision} />
+        <RemoveNodeDialog open onClose={() => setRemoveSnapshot(null)} node={removeTarget} provision={provision} />
       )}
       <AddNodeDialog open={addOpen} onClose={() => setAddOpen(false)} onLaunched={onLaunched} />
     </Box>

@@ -49,6 +49,21 @@ export function DrainProgress({ nodeId, enabled, dense = false }: DrainProgressP
       </Alert>
     );
   }
+  if (data.status === 'active') {
+    // Honest state: the server hasn't registered a drain (yet). The poll
+    // keeps running while this surface is visible, so a just-started drain
+    // flips to real numbers on the next tick.
+    return dense ? (
+      <Typography variant="caption" color="text.secondary">
+        drain not registered — node still active
+      </Typography>
+    ) : (
+      <Typography variant="body2" color="text.secondary">
+        The node still reports <strong>active</strong> — no drain in progress. If you just started one, this updates
+        within a couple of seconds.
+      </Typography>
+    );
+  }
   if (data.status === 'down') {
     return dense ? (
       <Chip size="small" color="error" variant="outlined" label="down" />
