@@ -33,7 +33,16 @@ export interface ObsescCapabilities {
   custody: boolean;
   alerting: boolean;
   compaction: boolean;
-  cluster: { enabled: boolean; routing: 'owner' | 'arrival' };
+  cluster: {
+    enabled: boolean;
+    routing: 'owner' | 'arrival';
+    /**
+     * True when the node can launch/terminate EC2 instances (control-plane
+     * provisioning wired: IAM role + launch template). Gates Add-node and
+     * the terminate option; drain/remove of existing members works without it.
+     */
+    provision: boolean;
+  };
 }
 
 export interface CapabilitiesState extends ObsescCapabilities {
@@ -59,7 +68,7 @@ export const DISABLED_CAPABILITIES: CapabilitiesState = {
   custody: false,
   alerting: false,
   compaction: false,
-  cluster: { enabled: false, routing: 'owner' },
+  cluster: { enabled: false, routing: 'owner', provision: false },
   unavailable: true,
 };
 
@@ -107,12 +116,8 @@ export function toCapabilitiesState(body: unknown): CapabilitiesState {
   }
   const b = body as Record<string, unknown>;
   const bool = (v: unknown): boolean => v === true;
-  const crosstab = (typeof b.crosstab === 'object' && b.crosstab !== null
-    ? b.crosstab
-    : {}) as Record<string, unknown>;
-  const cluster = (typeof b.cluster === 'object' && b.cluster !== null
-    ? b.cluster
-    : {}) as Record<string, unknown>;
+  const crosstab = (typeof b.crosstab === 'object' && b.crosstab !== null ? b.crosstab : {}) as Record<string, unknown>;
+  const cluster = (typeof b.cluster === 'object' && b.cluster !== null ? b.cluster : {}) as Record<string, unknown>;
   const pairs: CapabilityCrosstabPair[] = Array.isArray(crosstab.pairs)
     ? crosstab.pairs.filter(
         (p): p is CapabilityCrosstabPair =>
@@ -134,6 +139,8 @@ export function toCapabilitiesState(body: unknown): CapabilitiesState {
     cluster: {
       enabled: bool(cluster.enabled),
       routing: cluster.routing === 'arrival' ? 'arrival' : 'owner',
+      // Absent on pre-control-plane nodes → false (actions stay gated).
+      provision: bool(cluster.provision),
     },
     unavailable: false,
   };

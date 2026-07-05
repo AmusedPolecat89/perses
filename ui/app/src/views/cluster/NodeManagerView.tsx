@@ -1,52 +1,38 @@
 // Copyright OBSESC Authors
 //
-// NodeManager view — the operator's fleet surface. Members come live from
-// `GET /v1/cluster` (epoch, routing mode, active ring members); per-node
-// stats come from this node's /v1/health + /metrics. When the endpoint is
-// unreachable or clustering is disabled, falls back to a single local card.
-//
-// Preview-mode caveats are surfaced inline so the operator knows what's
-// stubbed (e.g. "Add node" is disabled until v0.3, instance type is
-// hardcoded until obsesc_node_info ships).
+// NodeManager view — the operator's fleet surface, live (Phase 4).
+// Membership (id/addr/role/status), epoch and routing come from
+// `GET /v1/cluster`; per-node stats from this node's /v1/health + /metrics
+// (including obsesc_node_info for the real instance type). Lifecycle
+// actions (add / drain+remove / blue-green resize) gate tri-state on
+// useCapabilities().cluster:
+//   - cluster disabled (or unknown)      → read-only presentation, no actions
+//   - enabled but provision=false        → drain/remove live; Add/Resize
+//                                          launches blocked ("provisioning
+//                                          disabled" tooltip)
+//   - enabled + provision                → everything live
+// Frictionless ops: every action is one dialog with an honest cost preview
+// before commit — no AWS console hand-offs.
 
-import { ReactElement, useState } from 'react';
-import { useQuery } from '@tanstack/react-query';
+import { ReactElement, useEffect, useMemo, useState } from 'react';
 import { Box, Button, Chip, Stack, Tooltip, Typography } from '@mui/material';
+import { useCapabilities } from '../../hooks/use-capabilities';
 import { useNodeStats } from './use-node-stats';
 import { NodeCard } from './NodeCard';
 import { ResizeDialog } from './ResizeDialog';
 import { AddNodeDialog } from './AddNodeDialog';
 import { ProjectSettings } from './ProjectSettings';
 import { FingerprintEpochCard } from './FingerprintEpochCard';
+import { ClusterMembersCard, PendingLaunch } from './ClusterMembersCard';
+import { RemoveNodeDialog } from './RemoveNodeDialog';
+import { ActivityFeedCard } from './ActivityFeedCard';
+import { ClusterNode, useClusterView } from './use-cluster';
 
-// TODO(β.3.5): once obsesc_node_info{instance_type="…"} is exposed by
-// obsesc-node at boot (pulled from EC2 metadata), read this from
-// useNodeStats() instead of hardcoding. Today's value matches the
-// brief's c7i.2xlarge target.
+// Fallback when /metrics doesn't carry obsesc_node_info (older node) —
+// every surface that uses it labels the value "estimated".
 const DEFAULT_INSTANCE_ID = 'c7i.2xlarge';
 
-interface ClusterView {
-  enabled: boolean;
-  epoch: number;
-  this_node: string | null;
-  routing: 'owner' | 'arrival';
-  nodes: Array<{ id: string; addr: string }>;
-}
-
-function useClusterView() {
-  return useQuery<ClusterView | null>({
-    queryKey: ['obsesc-cluster-view'],
-    refetchInterval: 10_000,
-    queryFn: async () => {
-      const res = await fetch('/obsesc-api/v1/cluster');
-      if (!res.ok) return null; // older node / endpoint absent → fallback
-      return (await res.json()) as ClusterView;
-    },
-    retry: false,
-  });
-}
-
-const ROUTING_COPY: Record<ClusterView['routing'], string> = {
+const ROUTING_COPY: Record<'owner' | 'arrival', string> = {
   arrival:
     'Shard-by-arrival: every node keeps what it receives — no forwarding hop. Queries fan out cluster-wide, so any node answers with complete results. Adding a node is instant capacity.',
   owner:
@@ -54,18 +40,52 @@ const ROUTING_COPY: Record<ClusterView['routing'], string> = {
 };
 
 export default function NodeManagerView(): ReactElement {
+  const caps = useCapabilities();
   const { data: stats, isLoading, error } = useNodeStats(5_000);
-  const { data: cluster } = useClusterView();
-  const [resizeTarget, setResizeTarget] = useState<string | null>(null);
+  const [pendingLaunch, setPendingLaunch] = useState<PendingLaunch | null>(null);
+  const [nodesAtLaunch, setNodesAtLaunch] = useState(0);
+  // Poll membership fast while a launch is in flight so the self-join
+  // (epoch advance + new member) shows up promptly.
+  const { data: cluster } = useClusterView(pendingLaunch ? 3_000 : 10_000);
+  const [resizeTargetId, setResizeTargetId] = useState<string | null>(null);
+  const [removeTargetId, setRemoveTargetId] = useState<string | null>(null);
   const [addOpen, setAddOpen] = useState(false);
 
-  // Live membership when available; single local card otherwise.
-  const members: Array<{ id: string; addr?: string }> =
-    cluster?.enabled && cluster.nodes.length > 0
-      ? cluster.nodes
-      : [{ id: 'this node' }];
+  // Tri-state capability gate (standard #4): actions only render once the
+  // capability is CONFIRMED — loading/unreachable are read-only, not "off".
+  const clusterCap = caps.cluster;
+  const actionsEnabled = !caps.isLoading && !caps.unavailable && clusterCap.enabled;
+  const provision = actionsEnabled && clusterCap.provision;
+
+  // Clear the optimistic launching row once the node self-joins — by id
+  // (contract assumption: member id == EC2 instance id) or, failing that,
+  // when membership simply grew past its at-launch size.
+  const nodes = useMemo(() => cluster?.nodes ?? [], [cluster]);
+  useEffect(() => {
+    if (pendingLaunch && (nodes.some((n) => n.id === pendingLaunch.instanceId) || nodes.length > nodesAtLaunch)) {
+      setPendingLaunch(null);
+    }
+  }, [pendingLaunch, nodes, nodesAtLaunch]);
+
+  const onLaunched = (instanceId: string, instanceType: string): void => {
+    setNodesAtLaunch(nodes.length);
+    setPendingLaunch({ instanceId, instanceType });
+  };
+
+  const clusterLive = cluster?.enabled === true && nodes.length > 0;
   const routing = cluster?.routing ?? 'owner';
-  const multi = members.length > 1;
+  const thisNodeId = cluster?.this_node ?? null;
+  const instanceType = stats?.instanceType ?? null;
+
+  // Dialog targets resolve LIVE against the current membership so status
+  // transitions (draining → drained → gone) flow into the open dialog.
+  const resizeTarget: ClusterNode | null =
+    nodes.find((n) => n.id === resizeTargetId) ??
+    (resizeTargetId !== null
+      ? // Fallback when /v1/cluster is absent: a synthetic single-node member.
+        { id: resizeTargetId, addr: '', role: stats?.nodeRole ?? 'all', status: 'active' }
+      : null);
+  const removeTarget: ClusterNode | null = nodes.find((n) => n.id === removeTargetId) ?? null;
 
   return (
     <Box sx={{ padding: 3, maxWidth: 1280, mx: 'auto' }}>
@@ -89,61 +109,90 @@ export default function NodeManagerView(): ReactElement {
             )}
           </Stack>
           <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5 }}>
-            {!multi
+            {!clusterLive
               ? 'Single-node deployment. Resize this node to handle more load, or add a second node for horizontal scale.'
-              : `${members.length} active members. ${
+              : `${nodes.length} member${nodes.length === 1 ? '' : 's'}. ${
                   routing === 'arrival'
                     ? 'Every node ingests what it receives; queries fan out cluster-wide.'
                     : 'Each node owns a slice of services; ingest and queries route to owners.'
                 }`}
           </Typography>
         </Box>
-        <Button variant="contained" onClick={() => setAddOpen(true)}>
-          + Add node
-        </Button>
+        {actionsEnabled &&
+          (provision ? (
+            <Button variant="contained" onClick={() => setAddOpen(true)}>
+              + Add node
+            </Button>
+          ) : (
+            <Tooltip title="Provisioning disabled — this deployment has no EC2 launch permissions (IAM role / launch template). Launch instances from the AMI yourself; they self-join.">
+              <span>
+                <Button variant="contained" disabled>
+                  + Add node
+                </Button>
+              </span>
+            </Tooltip>
+          ))}
       </Stack>
 
+      {/* Live membership: every manifest node with role + status. */}
+      {clusterLive && cluster && (
+        <ClusterMembersCard
+          cluster={cluster}
+          pendingLaunch={pendingLaunch}
+          actionsEnabled={actionsEnabled}
+          onResize={(node) => setResizeTargetId(node.id)}
+          onRemove={(node) => setRemoveTargetId(node.id)}
+        />
+      )}
+
+      {/* This node's live gauges (peers are reached via their own UIs). */}
       <Stack direction="row" flexWrap="wrap" gap={2} sx={{ mt: 2 }}>
-        {members.map((node) => {
-          const isThisNode = !multi || node.id === cluster?.this_node;
-          return (
-            <NodeCard
-              key={node.id}
-              name={
-                node.id === cluster?.this_node ? `${node.id} (this node)` : node.id
-              }
-              instanceId={DEFAULT_INSTANCE_ID}
-              // Live stats come from THIS node's /metrics; peers show
-              // membership + address until per-peer scrape lands.
-              stats={isThisNode ? stats : undefined}
-              isLoading={isThisNode ? isLoading : false}
-              error={isThisNode ? error : null}
-              peerAddr={!isThisNode ? node.addr : undefined}
-              onResize={() => setResizeTarget(node.id)}
-            />
-          );
-        })}
+        <NodeCard
+          name={thisNodeId ? `${thisNodeId} (this node)` : 'this node'}
+          instanceId={instanceType ?? DEFAULT_INSTANCE_ID}
+          instanceEstimated={instanceType === null}
+          stats={stats}
+          isLoading={isLoading}
+          error={error}
+          onResize={actionsEnabled ? (): void => setResizeTargetId(thisNodeId ?? 'this node') : undefined}
+        />
       </Stack>
 
-      {!multi && (
+      {!caps.isLoading && caps.unavailable && (
         <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 3 }}>
-          Preview view — live stats are real, but the resize and add-node actions are
-          UI scaffolds until the cluster control plane lands. Confirming a resize will
-          show the cost delta but not yet provision the new instance.
+          Node unreachable — membership and lifecycle actions will load once the node answers.
         </Typography>
       )}
+      {!caps.isLoading && !caps.unavailable && !clusterCap.enabled && (
+        <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 3 }}>
+          Read-only view — the cluster control plane isn&apos;t enabled on this node (cluster.enabled in config.yaml).
+          Live stats are real; add/resize/remove unlock when clustering is on.
+        </Typography>
+      )}
+
+      {/* Operator audit trail (launch / drain / remove / terminate). */}
+      <ActivityFeedCard enabled={actionsEnabled} />
 
       {/* Lane U4: epoch admin — self-gates (tri-state) on useCapabilities(). */}
       <FingerprintEpochCard />
 
       <ProjectSettings />
 
-      <ResizeDialog
-        open={resizeTarget !== null}
-        onClose={() => setResizeTarget(null)}
-        currentInstanceId={DEFAULT_INSTANCE_ID}
-      />
-      <AddNodeDialog open={addOpen} onClose={() => setAddOpen(false)} />
+      {resizeTarget && (
+        <ResizeDialog
+          open
+          onClose={() => setResizeTargetId(null)}
+          node={resizeTarget}
+          nodes={nodes}
+          currentInstanceType={resizeTarget.id === thisNodeId || !clusterLive ? instanceType : null}
+          provision={provision}
+          onLaunched={onLaunched}
+        />
+      )}
+      {removeTarget && (
+        <RemoveNodeDialog open onClose={() => setRemoveTargetId(null)} node={removeTarget} provision={provision} />
+      )}
+      <AddNodeDialog open={addOpen} onClose={() => setAddOpen(false)} onLaunched={onLaunched} />
     </Box>
   );
 }

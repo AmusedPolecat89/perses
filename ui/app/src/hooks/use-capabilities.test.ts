@@ -24,7 +24,7 @@ describe('toCapabilitiesState', () => {
       custody: false,
       alerting: true,
       compaction: true,
-      cluster: { enabled: true, routing: 'arrival' },
+      cluster: { enabled: true, routing: 'arrival', provision: true },
     };
     const caps = toCapabilitiesState(wire);
     expect(caps.unavailable).toBe(false);
@@ -40,7 +40,13 @@ describe('toCapabilitiesState', () => {
     expect(caps.custody).toBe(false);
     expect(caps.alerting).toBe(true);
     expect(caps.compaction).toBe(true);
-    expect(caps.cluster).toEqual({ enabled: true, routing: 'arrival' });
+    expect(caps.cluster).toEqual({ enabled: true, routing: 'arrival', provision: true });
+    // Pre-control-plane nodes omit `provision` → coerced to false.
+    expect(toCapabilitiesState({ ...wire, cluster: { enabled: true, routing: 'owner' } }).cluster).toEqual({
+      enabled: true,
+      routing: 'owner',
+      provision: false,
+    });
   });
 
   it('treats malformed bodies as FAILURES (throws), never as "all disabled"', () => {
@@ -84,7 +90,7 @@ describe('toCapabilitiesState', () => {
       custody: false,
       alerting: false,
       compaction: false,
-      cluster: { enabled: false, routing: 'owner' },
+      cluster: { enabled: false, routing: 'owner', provision: false },
       unavailable: true,
     });
   });

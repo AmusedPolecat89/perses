@@ -1,138 +1,295 @@
 // Copyright OBSESC Authors
 //
-// Vertical (blue/green) resize confirm dialog. Pure UX scaffold today
-// — the actual EC2 spin-up + WAL replay + ingest cutover ships with
-// the backend cluster work. Confirm button is disabled with a
-// "Pending cluster v0.2" tooltip until that lands.
+// Resize = guided blue/green stepper (Phase 4). There is no hidden saga:
+// each step is an explicit operator click composing the cluster primitives
+//   1. launch a replacement of the target type   (POST /v1/cluster/nodes)
+//   2. drain the old node                        (POST …/drain + live poll)
+//   3. remove + terminate the old node           (DELETE …?terminate=)
+// The cost narrative is honest: step 1 shows the TRANSIENT double-cost from
+// the server's preview, plus the approximate final delta once the old node
+// is gone. Closing the dialog cancels nothing — the membership table keeps
+// showing reality and every step can be finished from the per-node actions.
 
 import { ReactElement, useState } from 'react';
 import {
+  Alert,
   Box,
   Button,
   Chip,
+  CircularProgress,
   Dialog,
   DialogActions,
   DialogContent,
   DialogTitle,
-  Divider,
   Stack,
-  Tooltip,
+  Step,
+  StepContent,
+  StepLabel,
+  Stepper,
   Typography,
 } from '@mui/material';
 import { findInstance, INSTANCE_TYPES, InstanceSpec, monthlyUsd } from './instance-types';
+import {
+  ClusterConflictError,
+  ClusterNode,
+  useAddNode,
+  useCostPreview,
+  useDrainStatus,
+  useRemoveNode,
+  useStartDrain,
+} from './use-cluster';
+import { CostPreviewBox } from './CostPreviewBox';
+import { DrainProgress } from './DrainProgress';
+import { usdDeltaPretty } from './format';
 
 interface ResizeDialogProps {
   open: boolean;
   onClose: () => void;
-  currentInstanceId: string;
+  /** The node being replaced. */
+  node: ClusterNode;
+  /** Live membership — used to detect the replacement's self-join. */
+  nodes: ClusterNode[];
+  /**
+   * The old node's instance type from obsesc_node_info, or null when the
+   * metric is absent (older node) — the final-delta estimate then says so.
+   */
+  currentInstanceType: string | null;
+  /** EC2 launch/terminate wired on this deployment. */
+  provision: boolean;
+  /** Bubbles the 202 up so the view shows the launching row + fast-polls. */
+  onLaunched: (instanceId: string, instanceType: string) => void;
 }
 
-export function ResizeDialog({ open, onClose, currentInstanceId }: ResizeDialogProps): ReactElement {
-  const current = findInstance(currentInstanceId);
-  const [selectedId, setSelectedId] = useState<string>(currentInstanceId);
-  const selected = findInstance(selectedId);
+export function ResizeDialog({
+  open,
+  onClose,
+  node,
+  nodes,
+  currentInstanceType,
+  provision,
+  onLaunched,
+}: ResizeDialogProps): ReactElement {
+  const [targetType, setTargetType] = useState<string>('c7i.4xlarge');
+  const [launched, setLaunched] = useState<{ instanceId: string; nodesAtLaunch: number } | null>(null);
 
-  const deltaUsd = current && selected ? monthlyUsd(selected) - monthlyUsd(current) : 0;
-  const isUpgrade = deltaUsd > 0;
-  const isNoOp = deltaUsd === 0;
+  const oldSpec: InstanceSpec | undefined = currentInstanceType ? findInstance(currentInstanceType) : undefined;
+  const newSpec = findInstance(targetType);
+
+  const preview = useCostPreview({ action: 'add', instance_type: targetType }, open && launched === null);
+  const launch = useAddNode();
+  const startDrain = useStartDrain();
+  const remove = useRemoveNode();
+
+  // Step 1 completes when the replacement self-joins: its instance id shows
+  // up as a member (contract assumption: node id == EC2 instance id), or —
+  // fallback — membership simply grew since the launch.
+  const joined =
+    launched !== null && (nodes.some((n) => n.id === launched.instanceId) || nodes.length > launched.nodesAtLaunch);
+  const drainStarted = node.status === 'draining' || startDrain.isSuccess;
+  const removed = remove.isSuccess;
+  // The step only advances past "drain" when the SERVER says drained.
+  const drainQuery = useDrainStatus(node.id, open && drainStarted && !removed);
+  const drained = drainQuery.data?.status === 'drained';
+  let activeStep = 3;
+  if (!joined) activeStep = 0;
+  else if (!drained) activeStep = 1;
+  else if (!removed) activeStep = 2;
+
+  // Approximate FINAL delta (old gone, new in): static price table, labeled.
+  const finalDelta = oldSpec && newSpec ? monthlyUsd(newSpec) - monthlyUsd(oldSpec) : undefined;
+
+  const close = (): void => {
+    launch.reset();
+    startDrain.reset();
+    remove.reset();
+    onClose();
+  };
+
+  const conflictAlert = (err: unknown, copy: string): ReactElement | null => {
+    if (err instanceof ClusterConflictError) {
+      return (
+        <Alert severity="info" variant="outlined">
+          {copy} {err.message}
+        </Alert>
+      );
+    }
+    if (err instanceof Error) {
+      return (
+        <Alert severity="error" variant="outlined">
+          {err.message}
+        </Alert>
+      );
+    }
+    return null;
+  };
 
   return (
-    <Dialog open={open} onClose={onClose} maxWidth="sm" fullWidth>
-      <DialogTitle>Resize node — vertical blue/green</DialogTitle>
+    <Dialog open={open} onClose={close} maxWidth="sm" fullWidth>
+      <DialogTitle>Resize {node.id} — blue/green replacement</DialogTitle>
       <DialogContent>
-        <Stack gap={2}>
-          <Typography variant="body2" color="text.secondary">
-            Provision a new EC2 of the chosen size, replay the WAL onto it, cut ingest
-            over once caught up, then tear down the old box. No data loss; brief outage
-            window during cutover (typically &lt;30s).
-          </Typography>
+        <Typography variant="body2" color="text.secondary" sx={{ mb: 1 }}>
+          Three explicit steps, no hidden automation: launch the replacement, drain the old node (no data loss — it
+          flushes everything first), then remove it. You can stop after any step; the member list always shows the true
+          state.
+        </Typography>
 
-          <Box>
-            <Typography variant="overline" color="text.secondary">
-              Choose instance type
-            </Typography>
-            <Stack direction="row" gap={1} flexWrap="wrap" sx={{ mt: 1 }}>
-              {INSTANCE_TYPES.map((spec) => (
-                <Chip
-                  key={spec.id}
-                  label={`${spec.id} · ${spec.vcpu} vCPU / ${spec.memoryGb} GB`}
-                  color={spec.id === selectedId ? 'primary' : 'default'}
-                  variant={spec.id === selectedId ? 'filled' : 'outlined'}
-                  onClick={() => setSelectedId(spec.id)}
+        <Stepper activeStep={activeStep} orientation="vertical">
+          {/* ── Step 1: launch replacement ─────────────────────────────── */}
+          <Step completed={joined}>
+            <StepLabel>Launch replacement node</StepLabel>
+            <StepContent>
+              <Stack gap={1.5}>
+                <Stack direction="row" gap={1} flexWrap="wrap">
+                  {INSTANCE_TYPES.map((spec) => (
+                    <Chip
+                      key={spec.id}
+                      label={`${spec.id} · ${spec.vcpu} vCPU / ${spec.memoryGb} GB`}
+                      color={spec.id === targetType ? 'primary' : 'default'}
+                      variant={spec.id === targetType ? 'filled' : 'outlined'}
+                      onClick={() => setTargetType(spec.id)}
+                      disabled={launched !== null}
+                    />
+                  ))}
+                </Stack>
+
+                <CostPreviewBox
+                  preview={preview.data}
+                  isLoading={preview.isLoading && preview.fetchStatus !== 'idle'}
+                  error={launched === null ? preview.error : null}
                 />
-              ))}
-            </Stack>
-            {selected && (
-              <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 1 }}>
-                {selected.recommendedFor}
-              </Typography>
-            )}
-          </Box>
+                <Typography variant="caption" color="text.secondary">
+                  That delta is the <strong>transient double-cost</strong> — old and new run side by side until step 3.
+                  Net change once {node.id} is removed:{' '}
+                  {finalDelta !== undefined ? (
+                    <strong>{usdDeltaPretty(finalDelta)}</strong>
+                  ) : (
+                    'unknown (the old node doesn’t report its instance type)'
+                  )}{' '}
+                  — approx, static price table
+                  {currentInstanceType === null ? ', current size estimated' : ''}.
+                </Typography>
 
-          <Divider />
+                {launch.isLoading && (
+                  <Stack direction="row" alignItems="center" gap={1}>
+                    <CircularProgress size={16} />
+                    <Typography variant="body2">Requesting launch…</Typography>
+                  </Stack>
+                )}
+                {conflictAlert(
+                  launch.error,
+                  'Provisioning is disabled on this deployment — launch the replacement yourself from the AMI and it will self-join.'
+                )}
+                {launched !== null && !joined && (
+                  <Typography variant="body2" color="text.secondary">
+                    Launch accepted ({launched.instanceId}) — waiting for the node to self-join the manifest (typically
+                    1–3 min)…
+                  </Typography>
+                )}
 
-          <Stack direction="row" justifyContent="space-between" alignItems="baseline">
-            <Box>
-              <Typography variant="caption" color="text.secondary">
-                Current
-              </Typography>
-              <Typography variant="body1">
-                {current?.id ?? '—'} · approx ${current ? monthlyUsd(current).toFixed(0) : '?'}/mo
-              </Typography>
-            </Box>
-            <Box textAlign="right">
-              <Typography variant="caption" color="text.secondary">
-                After resize
-              </Typography>
-              <Typography variant="body1">
-                {selected?.id ?? '—'} · approx ${selected ? monthlyUsd(selected).toFixed(0) : '?'}/mo
-              </Typography>
-            </Box>
-          </Stack>
+                {launched === null && (
+                  <Box>
+                    <Button
+                      variant="contained"
+                      disabled={launch.isLoading || !provision}
+                      onClick={() =>
+                        launch.mutate(
+                          { instance_type: targetType, role: node.role },
+                          {
+                            onSuccess: (accepted) => {
+                              setLaunched({
+                                instanceId: accepted.instance_id,
+                                nodesAtLaunch: nodes.length,
+                              });
+                              onLaunched(accepted.instance_id, targetType);
+                            },
+                          }
+                        )
+                      }
+                    >
+                      Launch replacement
+                    </Button>
+                    {!provision && (
+                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+                        Provisioning disabled — launch the instance from the AMI yourself; this stepper picks up at step
+                        2 once it joins.
+                      </Typography>
+                    )}
+                  </Box>
+                )}
+              </Stack>
+            </StepContent>
+          </Step>
 
-          <Box
-            sx={{
-              p: 1.5,
-              borderRadius: 1,
-              backgroundColor: isNoOp
-                ? 'background.lighter'
-                : isUpgrade
-                  ? 'rgba(245, 158, 11, 0.12)' // amber tint for cost increase
-                  : 'rgba(16, 185, 129, 0.12)', // green tint for cost decrease
-            }}
-          >
-            <Typography variant="body2">
-              {isNoOp ? (
-                'Same instance — no resize action.'
-              ) : (
-                <>
-                  <strong>
-                    {isUpgrade ? '+' : ''}${deltaUsd.toFixed(2)}/mo
-                  </strong>{' '}
-                  ({isUpgrade ? 'higher' : 'lower'} EC2 cost). Storage and S3 charges
-                  unchanged.
-                </>
-              )}
-            </Typography>
-            {!isNoOp && (
-              <Typography variant="caption" color="text.secondary">
-                Estimated rollover: ~2–5 min depending on WAL replay backlog.
-              </Typography>
-            )}
-          </Box>
-        </Stack>
+          {/* ── Step 2: drain the old node ─────────────────────────────── */}
+          <Step completed={activeStep > 1}>
+            <StepLabel>Drain {node.id}</StepLabel>
+            <StepContent>
+              <Stack gap={1.5}>
+                <Typography variant="body2" color="text.secondary">
+                  Routes ingest to the replacement and flushes {node.id}&apos;s open buckets + WAL. Nothing is removed
+                  yet.
+                </Typography>
+                {conflictAlert(startDrain.error, 'The cluster refused the drain:')}
+                {!drainStarted ? (
+                  <Box>
+                    <Button
+                      variant="contained"
+                      disabled={startDrain.isLoading}
+                      onClick={() => startDrain.mutate({ nodeId: node.id })}
+                    >
+                      Start drain
+                    </Button>
+                  </Box>
+                ) : (
+                  <DrainProgress nodeId={node.id} enabled={open && drainStarted && !removed} />
+                )}
+              </Stack>
+            </StepContent>
+          </Step>
+
+          {/* ── Step 3: remove + terminate the old node ─────────────────── */}
+          <Step completed={removed}>
+            <StepLabel>Remove {node.id}</StepLabel>
+            <StepContent>
+              <Stack gap={1.5}>
+                <Alert severity="success" variant="outlined">
+                  {node.id} is drained — open buckets and WAL backlog are at zero.
+                </Alert>
+                <Typography variant="body2" color="text.secondary">
+                  Removes the drained node from the manifest
+                  {provision
+                    ? ' and terminates its EC2 instance — billing for the old size stops here.'
+                    : '. Provisioning is disabled, so stop/terminate the old instance yourself afterwards.'}
+                </Typography>
+                {conflictAlert(remove.error, 'The cluster refused the removal:')}
+                {!removed ? (
+                  <Box>
+                    <Button
+                      variant="contained"
+                      color="error"
+                      disabled={remove.isLoading}
+                      onClick={() => remove.mutate({ nodeId: node.id, terminate: provision, force: false })}
+                    >
+                      Remove{provision ? ' + terminate' : ''} {node.id}
+                    </Button>
+                  </Box>
+                ) : null}
+              </Stack>
+            </StepContent>
+          </Step>
+        </Stepper>
+
+        {removed && remove.data && (
+          <Alert severity="success" variant="outlined" sx={{ mt: 2 }}>
+            Resize complete — {remove.data.removed} removed at epoch {remove.data.epoch}
+            {remove.data.terminated ? ' and its instance terminated.' : ' (instance left running).'}
+          </Alert>
+        )}
       </DialogContent>
       <DialogActions>
-        <Button onClick={onClose} color="inherit">
-          Cancel
+        <Button onClick={close} color="inherit">
+          {removed ? 'Close' : 'Cancel'}
         </Button>
-        <Tooltip title="Pending cluster control plane — backend caller lands in v0.2">
-          <span>
-            <Button variant="contained" disabled>
-              Confirm resize
-            </Button>
-          </span>
-        </Tooltip>
       </DialogActions>
     </Dialog>
   );
