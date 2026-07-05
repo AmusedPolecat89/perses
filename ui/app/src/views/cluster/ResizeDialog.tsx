@@ -50,22 +50,36 @@ import { usdDeltaPretty } from './format';
  * The baseline snapshot also lets a MANUALLY launched replacement
  * (provision=false) advance the stepper: any member that wasn't in the
  * ring when the flow first opened counts as the replacement having joined.
- * Cleared when the flow completes (old node removed).
+ *
+ * Lifetime rules — a stale baseline is a footgun (an UNRELATED node added
+ * later would read as "replacement joined" and send the operator straight
+ * to draining), so an entry only outlives its dialog when something durable
+ * happened (a launch was accepted, or the drain started):
+ *  - close() with nothing durable → the entry is dropped;
+ *  - un-launched entries also expire after a TTL (crash/navigation safety);
+ *  - the flow completing (old node removed) deletes the entry.
  */
 interface ResizeFlow {
   /** Member ids when this flow first opened. */
   baselineIds: string[];
   launched: { instanceId: string; nodesAtLaunch: number } | null;
+  createdAtMs: number;
 }
 const resizeFlows = new Map<string, ResizeFlow>();
 
+/** Un-launched flow memory older than this is stale, not a resume. */
+const RESIZE_FLOW_TTL_MS = 30 * 60_000;
+
 function getResizeFlow(nodeId: string, nodes: ClusterNode[]): ResizeFlow {
   const existing = resizeFlows.get(nodeId);
-  if (existing) return existing;
-  const created: ResizeFlow = { baselineIds: nodes.map((n) => n.id), launched: null };
+  if (existing && (existing.launched !== null || Date.now() - existing.createdAtMs <= RESIZE_FLOW_TTL_MS)) {
+    return existing;
+  }
+  const created: ResizeFlow = { baselineIds: nodes.map((n) => n.id), launched: null, createdAtMs: Date.now() };
   // Don't persist a baseline off an empty/still-loading membership snapshot —
   // it would make every later member look like "the replacement joined".
   if (nodes.length > 0) resizeFlows.set(nodeId, created);
+  else resizeFlows.delete(nodeId);
   return created;
 }
 
@@ -139,6 +153,13 @@ export function ResizeDialog({
   const finalDelta = oldSpec && newSpec ? monthlyUsd(newSpec) - monthlyUsd(oldSpec) : undefined;
 
   const close = (): void => {
+    // Nothing durable happened (no launch accepted, no drain started) →
+    // drop the flow memory so its baseline can't go stale and mislabel an
+    // unrelated future node as "the replacement joined" on reopen. Flows
+    // with a real launch/drain keep their memory — that resume is the point.
+    if (launched === null && !drainStarted) {
+      resizeFlows.delete(node.id);
+    }
     launch.reset();
     startDrain.reset();
     remove.reset();
