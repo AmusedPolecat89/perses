@@ -5,7 +5,7 @@
 // The fetch/react-query plumbing is covered by the e2e suite against a
 // live node.
 
-import { DISABLED_CAPABILITIES, toCapabilitiesState } from './use-capabilities';
+import { DEFAULT_INGEST_PORTS, DISABLED_CAPABILITIES, toCapabilitiesState } from './use-capabilities';
 
 describe('toCapabilitiesState', () => {
   it('parses a full wire response and stamps unavailable=false', () => {
@@ -25,6 +25,15 @@ describe('toCapabilitiesState', () => {
       alerting: true,
       compaction: true,
       cluster: { enabled: true, routing: 'arrival', provision: true },
+      // Non-default values prove the node's own ports flow through verbatim.
+      ingest_ports: {
+        otlp_http: 14318,
+        otlp_grpc: 14317,
+        vector: 9000,
+        es_bulk: 9200,
+        hec: 18088,
+        fluent: 24224,
+      },
     };
     const caps = toCapabilitiesState(wire);
     expect(caps.unavailable).toBe(false);
@@ -41,11 +50,69 @@ describe('toCapabilitiesState', () => {
     expect(caps.alerting).toBe(true);
     expect(caps.compaction).toBe(true);
     expect(caps.cluster).toEqual({ enabled: true, routing: 'arrival', provision: true });
+    expect(caps.ingest_ports).toEqual({
+      otlp_http: 14318,
+      otlp_grpc: 14317,
+      vector: 9000,
+      es_bulk: 9200,
+      hec: 18088,
+      fluent: 24224,
+    });
     // Pre-control-plane nodes omit `provision` → coerced to false.
     expect(toCapabilitiesState({ ...wire, cluster: { enabled: true, routing: 'owner' } }).cluster).toEqual({
       enabled: true,
       routing: 'owner',
       provision: false,
+    });
+  });
+
+  it('nulls ingest_ports on any malformed field without nuking other capabilities', () => {
+    const base = {
+      preview: true,
+      sql: true,
+      crosstab: { enabled: true, pairs: [] },
+      cluster: { enabled: false, routing: 'owner', provision: false },
+    };
+    const ports = {
+      otlp_http: 4318,
+      otlp_grpc: 4317,
+      vector: 9000,
+      es_bulk: 9200,
+      hec: 8088,
+      fluent: 24224,
+    };
+    // Missing field entirely (older node) → null, everything else intact.
+    const noPorts = toCapabilitiesState(base);
+    expect(noPorts.ingest_ports).toBeNull();
+    expect(noPorts.sql).toBe(true);
+    expect(noPorts.unavailable).toBe(false);
+    // All-or-nothing: one bad value nulls the whole object (never a mix of
+    // real node ports and compiled defaults).
+    for (const bad of [
+      { ...ports, hec: '18088' },
+      { ...ports, hec: 0 },
+      { ...ports, hec: 70000 },
+      { ...ports, hec: 8088.5 },
+      'x',
+      [],
+      null,
+    ]) {
+      const caps = toCapabilitiesState({ ...base, ingest_ports: bad });
+      expect(caps.ingest_ports).toBeNull();
+      expect(caps.sql).toBe(true);
+    }
+  });
+
+  it('DEFAULT_INGEST_PORTS pins the obsesc-config compiled defaults', () => {
+    // NOT the dev-only .phase-a offsets (14318/14317/18088) — the fallback
+    // must equal IngestConfig's Rust defaults; change them together.
+    expect(DEFAULT_INGEST_PORTS).toEqual({
+      otlp_http: 4318,
+      otlp_grpc: 4317,
+      vector: 9000,
+      es_bulk: 9200,
+      hec: 8088,
+      fluent: 24224,
     });
   });
 
@@ -91,6 +158,7 @@ describe('toCapabilitiesState', () => {
       alerting: false,
       compaction: false,
       cluster: { enabled: false, routing: 'owner', provision: false },
+      ingest_ports: null,
       unavailable: true,
     });
   });
