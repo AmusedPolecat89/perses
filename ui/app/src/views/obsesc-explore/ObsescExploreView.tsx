@@ -14,7 +14,7 @@
 // Fetches go straight to /obsesc-api (same pattern as use-node-stats):
 // this surface must work on a fresh node before any datasource exists.
 
-import { ReactElement, useMemo, useState } from 'react';
+import { ReactElement, ReactNode, useMemo, useState } from 'react';
 import {
   Alert,
   Box,
@@ -71,6 +71,14 @@ interface RawEventJson {
   body_utf8?: string;
   body_base64?: string;
   attributes: Record<string, unknown>;
+}
+
+/** POST /v1/raw_grep — verbatim within-window grep for the searched token. */
+interface RawGrepResponse {
+  events: RawEventJson[];
+  truncated: boolean;
+  files_scanned: number;
+  owners_failed?: number;
 }
 
 function gb(n: number): string {
@@ -365,21 +373,38 @@ const RANGES: Array<{ label: string; seconds: number }> = [
   { label: 'Last 24 hours', seconds: 24 * 3600 },
 ];
 
+/** Wrap every occurrence of `token` in the body in a <mark>. */
+function highlightToken(body: string, token: string): ReactNode {
+  if (!token) return body;
+  const parts = body.split(token);
+  if (parts.length === 1) return body;
+  const out: ReactNode[] = [];
+  parts.forEach((part, i) => {
+    if (i > 0) out.push(<mark key={i}>{token}</mark>);
+    out.push(part);
+  });
+  return out;
+}
+
 function NeedleSection(): ReactElement {
   const [token, setToken] = useState('');
   const [service, setService] = useState('');
   const [rangeSecs, setRangeSecs] = useState(3600);
   const [windows, setWindows] = useState<TokenWindow[] | null>(null);
   const [scanned, setScanned] = useState(0);
-  const [event, setEvent] = useState<RawEventJson | null>(null);
-  const [eventNote, setEventNote] = useState<string | null>(null);
+  // Snapshot of the token the CURRENT window list was searched with — the
+  // drill greps for this, so editing the input after a search can't grep
+  // a stale/different token.
+  const [searchedToken, setSearchedToken] = useState('');
+  const [grep, setGrep] = useState<RawGrepResponse | null>(null);
+  const [grepNote, setGrepNote] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const search = async () => {
     setWindows(null);
-    setEvent(null);
-    setEventNote(null);
+    setGrep(null);
+    setGrepNote(null);
     setError(null);
     setBusy(true);
     try {
@@ -395,6 +420,7 @@ function NeedleSection(): ReactElement {
       const d = (await r.json()) as { windows: TokenWindow[]; scanned_files: number };
       setWindows(d.windows);
       setScanned(d.scanned_files);
+      setSearchedToken(token);
     } catch (e) {
       setError(String(e));
     } finally {
@@ -403,26 +429,24 @@ function NeedleSection(): ReactElement {
   };
 
   const drill = async (w: TokenWindow) => {
-    setEvent(null);
-    setEventNote(null);
+    setGrep(null);
+    setGrepNote(null);
     try {
-      const r = await apiFetch('/v1/raw_event', {
+      const r = await apiFetch('/v1/raw_grep', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify({
           service: w.service,
-          timestamp_ns: w.window_start_ns,
-          window_ns: w.window_end_ns - w.window_start_ns,
+          from_ns: w.window_start_ns,
+          to_ns: w.window_end_ns,
+          token: searchedToken,
+          limit: 5,
         }),
       });
-      if (r.status === 404) {
-        setEventNote('No raw row surfaced for this window yet (still inside the flush window?).');
-        return;
-      }
       if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
-      setEvent((await r.json()) as RawEventJson);
+      setGrep((await r.json()) as RawGrepResponse);
     } catch (e) {
-      setEventNote(String(e));
+      setGrepNote(String(e));
     }
   };
 
@@ -432,8 +456,9 @@ function NeedleSection(): ReactElement {
         Needle search
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-        Grep months of raw logs for one token (a request id, an IP, an error string). Token blooms
-        prune to the candidate windows; the drill-down lands on the verbatim event.
+        Grep months of raw logs for one token (a request id, an IP, an error string). Token blooms prune to the
+        candidate windows; the drill-down greps the window and shows only verbatim matches — a bloom false positive says
+        so instead of showing an unrelated event.
       </Typography>
       <Stack direction="row" gap={1.5} alignItems="center" flexWrap="wrap">
         <TextField
@@ -481,8 +506,8 @@ function NeedleSection(): ReactElement {
       {windows && (
         <Box sx={{ mt: 2 }}>
           <Typography variant="body2" color="text.secondary">
-            {windows.length} candidate window{windows.length === 1 ? '' : 's'} · {scanned} summary
-            files consulted{windows.length > 0 ? ' — click a window for the raw event' : ''}
+            {windows.length} candidate window{windows.length === 1 ? '' : 's'} · {scanned} summary files consulted
+            {windows.length > 0 ? ' — click a window to grep it for verbatim matches' : ''}
           </Typography>
           {windows.length > 0 && (
             <table style={{ borderCollapse: 'collapse', width: '100%', marginTop: 8 }}>
@@ -495,7 +520,7 @@ function NeedleSection(): ReactElement {
                       borderTop: '1px solid rgba(128,128,128,0.15)',
                       cursor: 'pointer',
                     }}
-                    title="Fetch the raw event from this window"
+                    title="Grep this window for verbatim matches"
                   >
                     <td style={{ padding: '5px 12px 5px 0' }}>
                       <Typography variant="body2" sx={mono}>
@@ -529,28 +554,56 @@ function NeedleSection(): ReactElement {
         </Box>
       )}
 
-      {eventNote && (
-        <Alert severity="info" sx={{ mt: 1.5 }}>
-          {eventNote}
+      {grepNote && (
+        <Alert severity="error" sx={{ mt: 1.5, ...mono, fontSize: 12 }}>
+          {grepNote}
         </Alert>
       )}
-      {event && (
-        <Box
-          sx={{
-            mt: 1.5,
-            padding: 1.5,
-            borderRadius: 1,
-            border: '1px solid',
-            borderColor: 'background.border',
-          }}
-          data-testid="needle-raw-event"
-        >
-          <Typography variant="overline" color="text.secondary">
-            Raw event · {event.service} · {tsPretty(event.timestamp_ns)} · via {event.source}
+      {grep && (grep.owners_failed ?? 0) > 0 && (
+        <Alert severity="warning" sx={{ mt: 1.5 }}>
+          {grep.owners_failed} owner node{grep.owners_failed === 1 ? '' : 's'} failed to answer — coverage is partial;
+          matches below may be incomplete.
+        </Alert>
+      )}
+      {grep && grep.events.length === 0 && grep.files_scanned === 0 && (
+        <Alert severity="info" sx={{ mt: 1.5 }}>
+          No raw files cover this window yet (still inside the flush window?).
+        </Alert>
+      )}
+      {grep && grep.events.length === 0 && grep.files_scanned > 0 && (
+        <Alert severity="info" sx={{ mt: 1.5 }} data-testid="needle-honest-miss">
+          No verbatim match for &quot;{searchedToken}&quot; in this window — the bloom candidate was a false positive.
+        </Alert>
+      )}
+      {grep && grep.events.length > 0 && (
+        <Box sx={{ mt: 1.5 }}>
+          <Typography variant="body2" color="text.secondary">
+            {grep.events.length} verbatim match{grep.events.length === 1 ? '' : 'es'}
+            {grep.truncated ? ` — more exist, showing the first ${grep.events.length}` : ''} · {grep.files_scanned} raw
+            file{grep.files_scanned === 1 ? '' : 's'} scanned
           </Typography>
-          <Typography component="pre" sx={{ ...mono, fontSize: 12, whiteSpace: 'pre-wrap', m: 0 }}>
-            {event.body_utf8 ?? `(binary body, base64) ${event.body_base64 ?? ''}`}
-          </Typography>
+          {grep.events.map((ev, i) => (
+            <Box
+              key={i}
+              sx={{
+                mt: 1,
+                padding: 1.5,
+                borderRadius: 1,
+                border: '1px solid',
+                borderColor: 'background.border',
+              }}
+              data-testid="needle-raw-event"
+            >
+              <Typography variant="overline" color="text.secondary">
+                Raw event · {ev.service} · {tsPretty(ev.timestamp_ns)} · via {ev.source}
+              </Typography>
+              <Typography component="pre" sx={{ ...mono, fontSize: 12, whiteSpace: 'pre-wrap', m: 0 }}>
+                {ev.body_utf8 !== undefined
+                  ? highlightToken(ev.body_utf8, searchedToken)
+                  : `(binary body, base64) ${ev.body_base64 ?? ''}`}
+              </Typography>
+            </Box>
+          ))}
         </Box>
       )}
     </Box>
