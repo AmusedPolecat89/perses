@@ -99,3 +99,97 @@ func TestServeASTFilesContentType(t *testing.T) {
 	assert.Equal(t, "text/html; charset=utf-8", rec.Header().Get("Content-Type"))
 	assert.Equal(t, "nosniff", rec.Header().Get("X-Content-Type-Options"))
 }
+
+func TestRouterMiddlewareSpaFallback(t *testing.T) {
+	// Override the package-level embedded filesystem with test data.
+	originalAsts := asts
+	t.Cleanup(func() { asts = originalAsts })
+
+	testFS := fstest.MapFS{
+		"app/dist/index.html":     &fstest.MapFile{Data: []byte("<html><head></head><body></body></html>")},
+		"app/dist/main.abc123.js": &fstest.MapFile{Data: []byte("console.log('hello')")},
+	}
+	asts = http.FS(testFS)
+
+	// Every OBSESC route plus the upstream /explore precedent must serve
+	// index.html on direct load (the SPA fallback); asset paths and unknown
+	// paths must fall through to next() so assetHandler / the 404 path
+	// handles them.
+	spaRoutes := []string{
+		"/alerts",
+		"/cluster",
+		"/onboarding",
+		"/explore",
+		"/foresight",
+		"/investigate",
+		"/integrity",
+	}
+	for _, route := range spaRoutes {
+		t.Run("serves index for "+route, func(t *testing.T) {
+			f := &frontend{apiPrefix: ""}
+			e := echo.New()
+			req := httptest.NewRequest(http.MethodGet, route, nil)
+			rec := httptest.NewRecorder()
+			ctx := e.NewContext(req, rec)
+
+			nextCalled := false
+			next := func(echo.Context) error {
+				nextCalled = true
+				return nil
+			}
+			err := f.routerMiddleware()(next)(ctx)
+			require.NoError(t, err)
+			assert.False(t, nextCalled, "SPA route must not fall through to the asset handler")
+			assert.Equal(t, http.StatusOK, rec.Code)
+			assert.Equal(t, "text/html; charset=utf-8", rec.Header().Get("Content-Type"))
+			assert.Equal(t, "nosniff", rec.Header().Get("X-Content-Type-Options"))
+		})
+	}
+
+	for _, path := range []string{"/app/dist/main.abc123.js", "/definitely-not-a-route"} {
+		t.Run("falls through for "+path, func(t *testing.T) {
+			f := &frontend{apiPrefix: ""}
+			e := echo.New()
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			rec := httptest.NewRecorder()
+			ctx := e.NewContext(req, rec)
+
+			nextCalled := false
+			next := func(echo.Context) error {
+				nextCalled = true
+				return nil
+			}
+			err := f.routerMiddleware()(next)(ctx)
+			require.NoError(t, err)
+			assert.True(t, nextCalled, "non-route path must fall through to next()")
+		})
+	}
+
+	t.Run("apiPrefix joins the route prefix", func(t *testing.T) {
+		f := &frontend{apiPrefix: "/perses"}
+		e := echo.New()
+
+		// The prefixed path serves index.html…
+		req := httptest.NewRequest(http.MethodGet, "/perses/investigate", nil)
+		rec := httptest.NewRecorder()
+		ctx := e.NewContext(req, rec)
+		nextCalled := false
+		next := func(echo.Context) error {
+			nextCalled = true
+			return nil
+		}
+		err := f.routerMiddleware()(next)(ctx)
+		require.NoError(t, err)
+		assert.False(t, nextCalled)
+		assert.Equal(t, "text/html; charset=utf-8", rec.Header().Get("Content-Type"))
+
+		// …while the bare path falls through.
+		req = httptest.NewRequest(http.MethodGet, "/investigate", nil)
+		rec = httptest.NewRecorder()
+		ctx = e.NewContext(req, rec)
+		nextCalled = false
+		err = f.routerMiddleware()(next)(ctx)
+		require.NoError(t, err)
+		assert.True(t, nextCalled, "un-prefixed path must not match when apiPrefix is set")
+	})
+}
