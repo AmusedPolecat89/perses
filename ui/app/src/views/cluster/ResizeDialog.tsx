@@ -11,12 +11,13 @@
 // showing reality and every step can be finished from the per-node actions.
 
 import { ReactElement, useState } from 'react';
+import { AsyncOpBar, AsyncOpStatus } from '../../components/progress/AsyncOp';
+import { useTrackedOp } from '../../components/progress/useAsyncOp';
 import {
   Alert,
   Box,
   Button,
   Chip,
-  CircularProgress,
   Dialog,
   DialogActions,
   DialogContent,
@@ -125,6 +126,14 @@ export function ResizeDialog({
   const launch = useAddNode();
   const startDrain = useStartDrain();
   const remove = useRemoveNode();
+  // Every step here is a WRITE: elapsed + a receipt, no Cancel.
+  const launchOp = useTrackedOp(launch.isLoading, {
+    receipt: launch.data ? `instance ${launch.data.instance_id} starting` : null,
+  });
+  const drainOp = useTrackedOp(startDrain.isLoading);
+  const removeOp = useTrackedOp(remove.isLoading, {
+    receipt: remove.data ? `removed at epoch ${remove.data.epoch}` : null,
+  });
 
   // Step 1 completes from OBSERVABLE state, not just the launch mutation:
   //  - the launched instance id shows up as a member (contract assumption:
@@ -230,12 +239,13 @@ export function ResizeDialog({
                   {currentInstanceType === null ? ', current size estimated' : ''}.
                 </Typography>
 
-                {launch.isLoading && (
-                  <Stack direction="row" alignItems="center" gap={1}>
-                    <CircularProgress size={16} />
-                    <Typography variant="body2">Requesting launch…</Typography>
-                  </Stack>
-                )}
+                <AsyncOpBar state={launchOp} testId="asyncop-bar-resize-launch" />
+                <AsyncOpStatus
+                  id="resize-launch"
+                  state={launchOp}
+                  label="Launch"
+                  runningHint="Requesting launch…"
+                />
                 {conflictAlert(
                   launch.error,
                   'Provisioning is disabled on this deployment — launch the replacement yourself from the AMI and it will self-join.'
@@ -291,6 +301,12 @@ export function ResizeDialog({
                   yet.
                 </Typography>
                 {conflictAlert(startDrain.error, 'The cluster refused the drain:')}
+                <AsyncOpStatus
+                  id="resize-drain"
+                  state={drainOp}
+                  label="Drain"
+                  runningHint="Starting drain…"
+                />
                 {!drainStarted ? (
                   <Box>
                     <Button
@@ -323,6 +339,12 @@ export function ResizeDialog({
                     : '. Provisioning is disabled, so stop/terminate the old instance yourself afterwards.'}
                 </Typography>
                 {conflictAlert(remove.error, 'The cluster refused the removal:')}
+                <AsyncOpStatus
+                  id="resize-remove"
+                  state={removeOp}
+                  label="Remove"
+                  runningHint="Removing the node from the manifest…"
+                />
                 {!removed ? (
                   <Box>
                     <Button

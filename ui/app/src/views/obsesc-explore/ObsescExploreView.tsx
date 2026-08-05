@@ -14,18 +14,11 @@
 // Fetches go straight to /obsesc-api (same pattern as use-node-stats):
 // this surface must work on a fresh node before any datasource exists.
 
-import { ReactElement, ReactNode, useMemo, useState } from 'react';
-import {
-  Alert,
-  Box,
-  Button,
-  Chip,
-  CircularProgress,
-  MenuItem,
-  Stack,
-  TextField,
-  Typography,
-} from '@mui/material';
+import { Fragment, ReactElement, ReactNode, useMemo, useState } from 'react';
+import { Alert, Box, Button, Chip, MenuItem, Stack, TextField, Typography } from '@mui/material';
+import { AsyncOpBar, AsyncOpStatus, asyncOpTriggerProps } from '../../components/progress/AsyncOp';
+import { useAsyncOp } from '../../components/progress/useAsyncOp';
+import { eitherSignal } from '../../utils/either-signal';
 
 const API = '/obsesc-api';
 const FETCH_TIMEOUT_MS = 60_000;
@@ -130,10 +123,13 @@ function renderCell(column: string, value: unknown): string {
   return s;
 }
 
-async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
+async function apiFetch(path: string, init?: RequestInit, signal?: AbortSignal): Promise<Response> {
   return fetch(`${API}${path}`, {
     ...init,
-    signal: AbortSignal.timeout(FETCH_TIMEOUT_MS),
+    // The caller's signal (supersede / Cancel / unmount) AND the hard
+    // deadline, whichever fires first — the deadline applies even when a
+    // caller signal is threaded.
+    signal: eitherSignal(signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)),
   });
 }
 
@@ -147,7 +143,7 @@ async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
 const SQL_PRESETS: Array<{ label: string; sql: string }> = [
   {
     label: 'sample rows',
-    sql: "SELECT timestamp_ns, service, body FROM raw_events\nWHERE timestamp_ns >= {NOW_MINUS_1H} AND timestamp_ns < {NOW}\nLIMIT 10",
+    sql: 'SELECT timestamp_ns, service, body FROM raw_events\nWHERE timestamp_ns >= {NOW_MINUS_1H} AND timestamp_ns < {NOW}\nLIMIT 10',
   },
   {
     label: 'grep bodies',
@@ -181,76 +177,91 @@ function materialise(sql: string): string {
     .replaceAll('{NOW}', String(Math.floor(now)));
 }
 
+/** Run's result: rows, OR the 402 cost gate — which is a product feature, not an error. */
+interface SqlRunResult {
+  rows: Array<Record<string, unknown>> | null;
+  gate: SqlGateResponse | null;
+}
+
 function SqlSection(): ReactElement {
   const [sql, setSql] = useState(materialise(SQL_PRESETS[0]!.sql));
-  const [estimate, setEstimate] = useState<CostPreview | null>(null);
-  const [gate, setGate] = useState<SqlGateResponse | null>(null);
-  const [rows, setRows] = useState<Array<Record<string, unknown>> | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState<'estimate' | 'run' | null>(null);
 
-  const columns = useMemo(() => (rows?.length ? Object.keys(rows[0]!) : []), [rows]);
-
-  const reset = () => {
-    setEstimate(null);
-    setGate(null);
-    setRows(null);
-    setError(null);
-  };
-
-  const runEstimate = async () => {
-    reset();
-    setBusy('estimate');
-    try {
-      const r = await apiFetch('/v1/sql/estimate', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sql, confirm: false }),
-      });
+  // TWO independent operations, TWO hook instances. The single shared
+  // `busy` token that used to live here is what swallowed Run clicks while
+  // an estimate was in flight (U5): Estimate's own state must never be able
+  // to disable Run, and neither control is disabled by its own work either.
+  const estimate = useAsyncOp<CostPreview, [string]>(
+    async (ctx, text) => {
+      const r = await apiFetch(
+        '/v1/sql/estimate',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sql: text, confirm: false }),
+        },
+        ctx.signal
+      );
       if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
-      setEstimate((await r.json()) as CostPreview);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(null);
-    }
-  };
+      const cost = (await r.json()) as CostPreview;
+      return {
+        data: cost,
+        receipt: `${cost.files} files after pruning · ~${gb(cost.decompressed_bytes_estimate)} to scan`,
+      };
+    },
+    { label: 'Estimate', timeoutMs: FETCH_TIMEOUT_MS }
+  );
 
-  const runQuery = async (maxCostUsd?: number) => {
-    setGate(null);
-    setRows(null);
-    setError(null);
-    setBusy('run');
-    try {
-      const r = await apiFetch('/v1/sql', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sql, confirm: true, max_cost_usd: maxCostUsd }),
-      });
+  const query = useAsyncOp<SqlRunResult, [string, number | undefined]>(
+    async (ctx, text, maxCostUsd) => {
+      const r = await apiFetch(
+        '/v1/sql',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ sql: text, confirm: true, max_cost_usd: maxCostUsd }),
+        },
+        ctx.signal
+      );
       if (r.status === 402) {
-        // The cost gate — a product feature, not a failure.
-        setGate((await r.json()) as SqlGateResponse);
-        return;
+        // The cost gate resolves as DATA, not an error: the run did exactly
+        // what it was supposed to do.
+        const gated = (await r.json()) as SqlGateResponse;
+        return { data: { rows: null, gate: gated }, receipt: 'stopped by the cost gate' };
       }
       if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
-      setRows((await r.json()) as Array<Record<string, unknown>>);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(null);
-    }
+      const got = (await r.json()) as Array<Record<string, unknown>>;
+      return {
+        data: { rows: got, gate: null },
+        receipt: `${got.length} row${got.length === 1 ? '' : 's'}`,
+      };
+    },
+    { label: 'Run', timeoutMs: FETCH_TIMEOUT_MS }
+  );
+
+  const cost = estimate.state.data;
+  const rows = query.state.data?.rows ?? null;
+  const gate = query.state.data?.gate ?? null;
+  const columns = useMemo(() => (rows?.length ? Object.keys(rows[0]!) : []), [rows]);
+
+  // One bar per region (two stacked bars would reflow); the status row
+  // below names both operations.
+  const regionBar = query.state.phase === 'running' ? query.state : estimate.state;
+
+  const reset = (): void => {
+    estimate.reset();
+    query.reset();
   };
 
   return (
     <Box sx={card}>
+      <AsyncOpBar state={regionBar} testId="asyncop-bar-sql" />
       <Typography variant="h6" sx={{ fontWeight: 600 }}>
         SQL over the raw tier
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-        Every event you ever ingested is an open Parquet table (<code>raw_events</code>). The
-        summary index prunes the scan; the estimate is the honest cost preview. Row scans gather
-        cluster-wide; aggregates (<code>count</code>/<code>GROUP BY</code>) are node-local today —
-        use the dashboards for cluster-wide aggregates.
+        Every event you ever ingested is an open Parquet table (<code>raw_events</code>). The summary index prunes the
+        scan; the estimate is the honest cost preview. Row scans gather cluster-wide; aggregates (<code>count</code>/
+        <code>GROUP BY</code>) are node-local today — use the dashboards for cluster-wide aggregates.
       </Typography>
       <Stack direction="row" gap={1} sx={{ mb: 1 }}>
         {SQL_PRESETS.map((p) => (
@@ -276,62 +287,88 @@ function SqlSection(): ReactElement {
         slotProps={{ input: { sx: { ...mono, fontSize: 13 } } }}
         aria-label="SQL query"
       />
-      <Stack direction="row" gap={1.5} alignItems="center" sx={{ mt: 1.5 }}>
-        <Button variant="outlined" onClick={runEstimate} disabled={busy !== null}>
-          Estimate
+      {/* flexWrap: the row must never squeeze its own buttons narrower while
+          the pointer is travelling toward them — a click lost to layout
+          shift has the same "nothing happened" signature as U5. */}
+      <Stack direction="row" gap={1.5} alignItems="center" flexWrap="wrap" sx={{ mt: 1.5 }}>
+        <Button variant="outlined" onClick={() => estimate.run(sql)} {...asyncOpTriggerProps(estimate.state)}>
+          {estimate.state.phase === 'running' ? 'Estimating…' : 'Estimate'}
         </Button>
-        <Button variant="contained" onClick={() => runQuery()} disabled={busy !== null}>
-          Run
+        <Button variant="contained" onClick={() => query.run(sql, undefined)} {...asyncOpTriggerProps(query.state)}>
+          {query.state.phase === 'running' ? 'Running…' : 'Run'}
         </Button>
-        {busy && <CircularProgress size={18} />}
-        {estimate && (
-          <Stack direction="row" gap={1}>
-            <Chip size="small" label={`${estimate.files} files after pruning`} />
-            <Chip size="small" label={`${gb(estimate.compressed_bytes)} on disk`} />
-            <Chip size="small" label={`~${gb(estimate.decompressed_bytes_estimate)} scanned`} />
-            <Chip size="small" color="primary" label={`$${estimate.cost_usd.toFixed(4)}`} />
-            <Chip size="small" label={`~${estimate.estimated_seconds.toFixed(1)}s`} />
-          </Stack>
-        )}
       </Stack>
+      {/* The reserved status slot: entering/leaving the running state costs
+          zero layout, and the receipt persists until the next run — a click
+          that failed to register leaves a stale receipt and no running
+          state, which is instantly legible as "that did nothing". */}
+      <Stack direction="row" gap={2.5} alignItems="center" flexWrap="wrap">
+        <AsyncOpStatus
+          id="sql-estimate"
+          state={estimate.state}
+          label="Estimate"
+          runningHint="Pruning the summary index for a cost preview…"
+          onCancel={estimate.cancel}
+        />
+        <AsyncOpStatus
+          id="sql-run"
+          state={query.state}
+          label="Run"
+          runningHint="Scanning the raw tier…"
+          idleHint="Estimate first, or just run it."
+          onCancel={query.cancel}
+        />
+      </Stack>
+      {cost && (
+        <Stack direction="row" gap={1} flexWrap="wrap" sx={{ mt: 0.5 }}>
+          <Chip size="small" label={`${cost.files} files after pruning`} />
+          <Chip size="small" label={`${gb(cost.compressed_bytes)} on disk`} />
+          <Chip size="small" label={`~${gb(cost.decompressed_bytes_estimate)} scanned`} />
+          <Chip size="small" color="primary" label={`$${cost.cost_usd.toFixed(4)}`} />
+          <Chip size="small" label={`~${cost.estimated_seconds.toFixed(1)}s`} />
+        </Stack>
+      )}
 
       {gate && (
         <Alert
           severity="warning"
           sx={{ mt: 1.5 }}
           action={
-            <Button
-              color="inherit"
-              size="small"
-              onClick={() => runQuery(Math.max(gate.cost.cost_usd * 2, 0.01))}
-            >
+            <Button color="inherit" size="small" onClick={() => query.run(sql, Math.max(gate.cost.cost_usd * 2, 0.01))}>
               Confirm &amp; run (~${gate.cost.cost_usd.toFixed(2)})
             </Button>
           }
         >
-          Cost gate: {gate.message} — {gate.cost.files} files, ~
-          {gb(gate.cost.decompressed_bytes_estimate)} scanned.
+          Cost gate: {gate.message} — {gate.cost.files} files, ~{gb(gate.cost.decompressed_bytes_estimate)} scanned.
         </Alert>
       )}
-      {error && (
+      {estimate.state.error !== null && (
         <Alert severity="error" sx={{ mt: 1.5, ...mono, fontSize: 12 }}>
-          {error}
+          {estimate.state.error}
+        </Alert>
+      )}
+      {query.state.error !== null && (
+        <Alert severity="error" sx={{ mt: 1.5, ...mono, fontSize: 12 }}>
+          {query.state.error}
         </Alert>
       )}
 
       {rows && (
-        <Box sx={{ mt: 2, overflowX: 'auto' }}>
+        // A re-run dims the previous table rather than blanking it for
+        // several seconds — stale, but visibly stale.
+        <Box
+          sx={{ mt: 2, overflowX: 'auto', opacity: query.state.phase === 'running' ? 0.45 : 1 }}
+          aria-busy={query.state.phase === 'running'}
+        >
           <Typography variant="caption" color="text.secondary">
             {rows.length} row{rows.length === 1 ? '' : 's'}
+            {query.state.phase === 'running' ? ' (previous run)' : ''}
           </Typography>
           <table style={{ borderCollapse: 'collapse', width: '100%' }} data-testid="sql-results">
             <thead>
               <tr>
                 {columns.map((c) => (
-                  <th
-                    key={c}
-                    style={{ textAlign: 'left', padding: '4px 12px 4px 0', opacity: 0.6 }}
-                  >
+                  <th key={c} style={{ textAlign: 'left', padding: '4px 12px 4px 0', opacity: 0.6 }}>
                     <Typography variant="caption" sx={mono}>
                       {c}
                     </Typography>
@@ -386,72 +423,98 @@ function highlightToken(body: string, token: string): ReactNode {
   return out;
 }
 
+/** What one search resolved to — the token snapshot travels WITH the result. */
+interface NeedleSearchResult {
+  windows: TokenWindow[];
+  scanned: number;
+  /** The token this window list was searched with — the drill greps for
+   *  exactly this, so editing the input afterwards can't grep a different
+   *  token, and a superseded search can't leave its token behind. */
+  searchedToken: string;
+}
+
 function NeedleSection(): ReactElement {
   const [token, setToken] = useState('');
   const [service, setService] = useState('');
   const [rangeSecs, setRangeSecs] = useState(3600);
-  const [windows, setWindows] = useState<TokenWindow[] | null>(null);
-  const [scanned, setScanned] = useState(0);
-  // Snapshot of the token the CURRENT window list was searched with — the
-  // drill greps for this, so editing the input after a search can't grep
-  // a stale/different token.
-  const [searchedToken, setSearchedToken] = useState('');
-  const [grep, setGrep] = useState<RawGrepResponse | null>(null);
-  const [grepNote, setGrepNote] = useState<string | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
+  /** The row a drill is running against — for the per-row busy state. */
+  const [drillTarget, setDrillTarget] = useState<TokenWindow | null>(null);
 
-  const search = async () => {
-    setWindows(null);
-    setGrep(null);
-    setGrepNote(null);
-    setError(null);
-    setBusy(true);
-    try {
+  // The hook's generation guard closes the stale-response race this search
+  // used to have: two searches in flight resolved in ARRIVAL order, so a
+  // slower older search overwrote the newer results.
+  const search = useAsyncOp<NeedleSearchResult, [string, string, number]>(
+    async (ctx, tok, svc, secs) => {
       const now = Date.now() * 1e6;
       const qs = new URLSearchParams({
-        token,
-        from_ns: String(Math.floor(now - rangeSecs * 1e9)),
+        token: tok,
+        from_ns: String(Math.floor(now - secs * 1e9)),
         to_ns: String(Math.floor(now)),
       });
-      if (service) qs.set('service', service);
-      const r = await apiFetch(`/v1/search_tokens?${qs}`);
+      if (svc) qs.set('service', svc);
+      const r = await apiFetch(`/v1/search_tokens?${qs}`, undefined, ctx.signal);
       if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
       const d = (await r.json()) as { windows: TokenWindow[]; scanned_files: number };
-      setWindows(d.windows);
-      setScanned(d.scanned_files);
-      setSearchedToken(token);
-    } catch (e) {
-      setError(String(e));
-    } finally {
-      setBusy(false);
-    }
+      return {
+        data: { windows: d.windows, scanned: d.scanned_files, searchedToken: tok },
+        receipt: `${d.windows.length} candidate window${d.windows.length === 1 ? '' : 's'} · ${
+          d.scanned_files
+        } summary files consulted`,
+      };
+    },
+    { label: 'Search', timeoutMs: FETCH_TIMEOUT_MS }
+  );
+
+  // The drill used to have NO feedback at all for ~10 s of raw-tier grep.
+  const drill = useAsyncOp<RawGrepResponse, [TokenWindow, string]>(
+    async (ctx, w, tok) => {
+      const r = await apiFetch(
+        '/v1/raw_grep',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            service: w.service,
+            from_ns: w.window_start_ns,
+            to_ns: w.window_end_ns,
+            token: tok,
+            limit: 5,
+          }),
+        },
+        ctx.signal
+      );
+      if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+      const got = (await r.json()) as RawGrepResponse;
+      return {
+        data: got,
+        receipt: `${got.events.length} verbatim match${got.events.length === 1 ? '' : 'es'} · ${
+          got.files_scanned
+        } raw file${got.files_scanned === 1 ? '' : 's'} scanned`,
+      };
+    },
+    { label: 'Grep', timeoutMs: FETCH_TIMEOUT_MS }
+  );
+
+  const result = search.state.data;
+  const windows = result?.windows ?? null;
+  const scanned = result?.scanned ?? 0;
+  const searchedToken = result?.searchedToken ?? '';
+  const grep = drill.state.data;
+  const drilling = drill.state.phase === 'running';
+
+  const onDrill = (w: TokenWindow): void => {
+    // Re-entry on the SAME row is a no-op; a different row supersedes.
+    if (drilling && drillTarget === w) return;
+    setDrillTarget(w);
+    drill.run(w, searchedToken);
   };
 
-  const drill = async (w: TokenWindow) => {
-    setGrep(null);
-    setGrepNote(null);
-    try {
-      const r = await apiFetch('/v1/raw_grep', {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          service: w.service,
-          from_ns: w.window_start_ns,
-          to_ns: w.window_end_ns,
-          token: searchedToken,
-          limit: 5,
-        }),
-      });
-      if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
-      setGrep((await r.json()) as RawGrepResponse);
-    } catch (e) {
-      setGrepNote(String(e));
-    }
-  };
+  const tokenTooShort = token.length < 3;
+  const regionBar = drilling ? drill.state : search.state;
 
   return (
     <Box sx={card}>
+      <AsyncOpBar state={regionBar} testId="asyncop-bar-needle" />
       <Typography variant="h6" sx={{ fontWeight: 600 }}>
         Needle search
       </Typography>
@@ -491,20 +554,51 @@ function NeedleSection(): ReactElement {
             </MenuItem>
           ))}
         </TextField>
-        <Button variant="contained" onClick={search} disabled={busy || token.length < 3}>
-          Search
+        {/* Blocked only by a PRECONDITION, never by in-flight work — and the
+            reason is rendered next to it instead of left mute. */}
+        <Button
+          variant="contained"
+          onClick={() => search.run(token, service, rangeSecs)}
+          disabled={tokenTooShort}
+          {...asyncOpTriggerProps(search.state)}
+        >
+          {search.state.phase === 'running' ? 'Searching…' : 'Search'}
         </Button>
-        {busy && <CircularProgress size={18} />}
+        {tokenTooShort && (
+          <Typography variant="caption" color="text.secondary">
+            enter at least 3 characters to search
+          </Typography>
+        )}
+      </Stack>
+      <Stack direction="row" gap={2.5} alignItems="center" flexWrap="wrap">
+        <AsyncOpStatus
+          id="needle-search"
+          state={search.state}
+          label="Search"
+          runningHint="Probing token blooms across the summary tier…"
+          onCancel={search.cancel}
+        />
+        <AsyncOpStatus
+          id="needle-drill"
+          state={drill.state}
+          label="Grep"
+          runningHint={
+            drillTarget
+              ? `Greping 1 window · ${drillTarget.event_count.toLocaleString()} events…`
+              : 'Greping the window…'
+          }
+          onCancel={drill.cancel}
+        />
       </Stack>
 
-      {error && (
+      {search.state.error !== null && (
         <Alert severity="error" sx={{ mt: 1.5, ...mono, fontSize: 12 }}>
-          {error}
+          {search.state.error}
         </Alert>
       )}
 
       {windows && (
-        <Box sx={{ mt: 2 }}>
+        <Box sx={{ mt: 2, opacity: search.state.phase === 'running' ? 0.45 : 1 }}>
           <Typography variant="body2" color="text.secondary">
             {windows.length} candidate window{windows.length === 1 ? '' : 's'} · {scanned} summary files consulted
             {windows.length > 0 ? ' — click a window to grep it for verbatim matches' : ''}
@@ -513,40 +607,52 @@ function NeedleSection(): ReactElement {
             <table style={{ borderCollapse: 'collapse', width: '100%', marginTop: 8 }}>
               <tbody>
                 {windows.slice(0, 50).map((w, i) => (
-                  <tr
-                    key={i}
-                    onClick={() => drill(w)}
-                    style={{
-                      borderTop: '1px solid rgba(128,128,128,0.15)',
-                      cursor: 'pointer',
-                    }}
-                    title="Grep this window for verbatim matches"
-                  >
-                    <td style={{ padding: '5px 12px 5px 0' }}>
-                      <Typography variant="body2" sx={mono}>
-                        {w.service}
-                      </Typography>
-                    </td>
-                    <td style={{ padding: '5px 12px 5px 0' }}>
-                      <Typography variant="body2" sx={{ ...mono, fontSize: 12 }}>
-                        {tsPretty(w.window_start_ns)} → {tsPretty(w.window_end_ns).slice(11)}
-                      </Typography>
-                    </td>
-                    <td style={{ padding: '5px 12px 5px 0' }}>
-                      <Typography variant="caption" color="text.secondary">
-                        {w.event_count.toLocaleString()} events
-                      </Typography>
-                    </td>
-                    <td style={{ padding: '5px 0' }}>
-                      {w.saturated ? (
-                        <Chip size="small" variant="outlined" color="warning" label="bloom saturated" />
-                      ) : w.bloom_match ? (
-                        <Chip size="small" variant="outlined" color="success" label="bloom hit" />
-                      ) : (
-                        <Chip size="small" variant="outlined" label="no bloom (maybe)" />
-                      )}
-                    </td>
-                  </tr>
+                  <Fragment key={i}>
+                    <tr
+                      onClick={() => onDrill(w)}
+                      aria-busy={drilling && drillTarget === w}
+                      data-testid="needle-window-row"
+                      style={{
+                        borderTop: '1px solid rgba(128,128,128,0.15)',
+                        cursor: 'pointer',
+                      }}
+                      title="Grep this window for verbatim matches"
+                    >
+                      <td style={{ padding: '5px 12px 5px 0' }}>
+                        <Typography variant="body2" sx={mono}>
+                          {w.service}
+                        </Typography>
+                      </td>
+                      <td style={{ padding: '5px 12px 5px 0' }}>
+                        <Typography variant="body2" sx={{ ...mono, fontSize: 12 }}>
+                          {tsPretty(w.window_start_ns)} → {tsPretty(w.window_end_ns).slice(11)}
+                        </Typography>
+                      </td>
+                      <td style={{ padding: '5px 12px 5px 0' }}>
+                        <Typography variant="caption" color="text.secondary">
+                          {w.event_count.toLocaleString()} events
+                        </Typography>
+                      </td>
+                      <td style={{ padding: '5px 0' }}>
+                        {w.saturated ? (
+                          <Chip size="small" variant="outlined" color="warning" label="bloom saturated" />
+                        ) : w.bloom_match ? (
+                          <Chip size="small" variant="outlined" color="success" label="bloom hit" />
+                        ) : (
+                          <Chip size="small" variant="outlined" label="no bloom (maybe)" />
+                        )}
+                      </td>
+                    </tr>
+                    {/* Row-scoped activity. The region bar runs too — a
+                      drilling row can be scrolled out of view. */}
+                    {drillTarget === w && (
+                      <tr>
+                        <td colSpan={4} style={{ padding: 0 }}>
+                          <AsyncOpBar state={drill.state} />
+                        </td>
+                      </tr>
+                    )}
+                  </Fragment>
                 ))}
               </tbody>
             </table>
@@ -554,9 +660,9 @@ function NeedleSection(): ReactElement {
         </Box>
       )}
 
-      {grepNote && (
+      {drill.state.error !== null && (
         <Alert severity="error" sx={{ mt: 1.5, ...mono, fontSize: 12 }}>
-          {grepNote}
+          {drill.state.error}
         </Alert>
       )}
       {grep && (grep.owners_failed ?? 0) > 0 && (
@@ -617,8 +723,7 @@ export default function ObsescExploreView(): ReactElement {
         Explore
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, mb: 2.5 }}>
-        The raw tier keeps 100% of every event as open Parquet. The summary index accelerates —
-        it never gatekeeps.
+        The raw tier keeps 100% of every event as open Parquet. The summary index accelerates — it never gatekeeps.
       </Typography>
       <Stack gap={2.5}>
         <SqlSection />

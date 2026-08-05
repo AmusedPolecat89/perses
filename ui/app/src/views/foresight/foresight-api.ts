@@ -15,8 +15,11 @@
 //   - `approximation` ("arrival-order, no trace correlation") is on
 //     every response and must ALWAYS be visible in the UI.
 
+import { eitherSignal } from '../../utils/either-signal';
+
 const API = '/obsesc-api';
-const FETCH_TIMEOUT_MS = 60_000;
+/** The deadline the progress status line quotes for both ops. */
+export const FETCH_TIMEOUT_MS = 60_000;
 
 // Server bounds (crates/query/obsesc-query/src/worldmodel.rs) — mirrored
 // client-side so the UI never submits a request the server will 400.
@@ -110,24 +113,6 @@ export interface ObsescWhatIfResponse {
   evidence: ObsescGatherEvidence;
   low_support: boolean;
   warning?: string;
-}
-
-/**
- * Abort when EITHER input aborts — the caller's controller (inputs
- * changed / a newer request superseded this one) or the hard timeout.
- * (`AbortSignal.any` shim: the app's TS lib target predates it.)
- */
-function eitherSignal(a: AbortSignal, b: AbortSignal): AbortSignal {
-  const ctl = new AbortController();
-  // Forward the originating abort REASON, so the 60s timeout surfaces as
-  // a TimeoutError (not a generic AbortError) in the error state.
-  const forward = (): void => ctl.abort(a.aborted ? a.reason : b.reason);
-  if (a.aborted || b.aborted) forward();
-  else {
-    a.addEventListener('abort', forward, { once: true });
-    b.addEventListener('abort', forward, { once: true });
-  }
-  return ctl.signal;
 }
 
 /** Wedge rule: every fetch times out AND aborts with the caller's signal. */

@@ -29,6 +29,9 @@ import {
 } from '@mui/material';
 import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { useCapabilities } from '../../hooks/use-capabilities';
+import { AsyncOpBar, AsyncOpStatus } from '../../components/progress/AsyncOp';
+import { useTrackedOp } from '../../components/progress/useAsyncOp';
+import { eitherSignal } from '../../utils/either-signal';
 
 const API = '/obsesc-api';
 const FETCH_TIMEOUT_MS = 60_000;
@@ -56,24 +59,6 @@ interface MintEpochResponse {
   services_scanned: number;
   idf_entries: number;
   manifest_epoch: number;
-}
-
-/**
- * `AbortSignal.any([...])` without `AbortSignal.any` (the app's TS lib
- * target predates it) — same pattern as use-capabilities.ts. Aborts when
- * EITHER input aborts (react-query's unmount/invalidation signal, or the
- * timeout).
- */
-function eitherSignal(a: AbortSignal | undefined, b: AbortSignal): AbortSignal {
-  if (!a) return b;
-  const ctl = new AbortController();
-  const onAbort = (): void => ctl.abort();
-  if (a.aborted || b.aborted) ctl.abort();
-  else {
-    a.addEventListener('abort', onAbort, { once: true });
-    b.addEventListener('abort', onAbort, { once: true });
-  }
-  return ctl.signal;
 }
 
 async function apiFetch(
@@ -274,6 +259,13 @@ function MintEpochDialog({ open, onClose, onMinted }: MintEpochDialogProps): Rea
     onSuccess: onMinted,
   });
 
+  // A WRITE: elapsed + a receipt, no Cancel — aborting the fetch would
+  // not un-mint an epoch, so offering one would lie.
+  const mintOp = useTrackedOp(mint.isLoading, {
+    timeoutMs: FETCH_TIMEOUT_MS,
+    receipt: mint.data ? `epoch ${mint.data.epoch_id} · ${mint.data.idf_entries} IDF keys` : null,
+  });
+
   const close = (): void => {
     mint.reset();
     onClose();
@@ -331,12 +323,13 @@ function MintEpochDialog({ open, onClose, onMinted }: MintEpochDialogProps): Rea
             supported by the endpoint yet.
           </Typography>
 
-          {mint.isLoading && (
-            <Stack direction="row" alignItems="center" gap={1}>
-              <CircularProgress size={16} />
-              <Typography variant="body2">Scanning the summary tier…</Typography>
-            </Stack>
-          )}
+          <AsyncOpBar state={mintOp} testId="asyncop-bar-mint" />
+          <AsyncOpStatus
+            id="cluster-mint"
+            state={mintOp}
+            label="Mint"
+            runningHint="Scanning the summary tier…"
+          />
 
           {mint.error instanceof StoresNotConfiguredError && (
             <Alert severity="info" variant="outlined">

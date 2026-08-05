@@ -24,19 +24,13 @@
 // ObsescExploreView / use-node-stats): the plugin client is not
 // importable from app views.
 
-import { ReactElement, useEffect, useRef, useState } from 'react';
-import {
-  Alert,
-  Box,
-  Button,
-  Chip,
-  CircularProgress,
-  Stack,
-  TextField,
-  Typography,
-} from '@mui/material';
+import { ReactElement, useState } from 'react';
+import { Alert, Box, Button, Chip, CircularProgress, Stack, TextField, Typography } from '@mui/material';
 import { useQuery } from '@tanstack/react-query';
 import { useCapabilities } from '../../hooks/use-capabilities';
+import { AsyncOpBar, AsyncOpStatus, asyncOpTriggerProps } from '../../components/progress/AsyncOp';
+import { useAsyncOp } from '../../components/progress/useAsyncOp';
+import { eitherSignal } from '../../utils/either-signal';
 
 const API = '/obsesc-api';
 /** The walk re-hashes up to max_files objects — generous, but abortable. */
@@ -163,22 +157,6 @@ function tsPretty(ns: number): string {
   return `${new Date(ns / 1e6).toISOString().replace('T', ' ').slice(0, 19)} UTC`;
 }
 
-/**
- * `AbortSignal.any` without `AbortSignal.any` (the app's TS lib target
- * predates it): aborts when EITHER input aborts — the operator's Cancel
- * button, or the timeout.
- */
-function eitherSignal(a: AbortSignal, b: AbortSignal): AbortSignal {
-  const ctl = new AbortController();
-  const onAbort = (): void => ctl.abort();
-  if (a.aborted || b.aborted) ctl.abort();
-  else {
-    a.addEventListener('abort', onAbort, { once: true });
-    b.addEventListener('abort', onAbort, { once: true });
-  }
-  return ctl.signal;
-}
-
 // ─── Service-list helper ────────────────────────────────────────────────
 // Chain ids are `service` (or `service#subshard`); derive the service
 // names from the summary tier the same way the dashboards do — a grouped
@@ -206,9 +184,7 @@ function useServiceNames(enabled: boolean): { services: string[]; failed: boolea
           aggregate: [{ op: 'count' }],
           group_by: ['service'],
         }),
-        signal: signal
-          ? eitherSignal(signal, AbortSignal.timeout(SERVICES_TIMEOUT_MS))
-          : AbortSignal.timeout(SERVICES_TIMEOUT_MS),
+        signal: eitherSignal(signal, AbortSignal.timeout(SERVICES_TIMEOUT_MS)),
       });
       if (!r.ok) throw new Error(`service list: HTTP ${r.status}`);
       const d = (await r.json()) as { rows: QueryRow[] };
@@ -396,40 +372,36 @@ function VerdictCard({
 
 // ─── The view ───────────────────────────────────────────────────────────
 
+/** One verify run: the report plus the bound the OPERATOR asked for. */
+interface VerifyResult {
+  report: CustodyVerifyReport;
+  requestedFromNs: number | null;
+}
+
 function VerifySection(): ReactElement {
   const [chainId, setChainId] = useState('');
   const [fromLocal, setFromLocal] = useState('');
   const [maxFiles, setMaxFiles] = useState(String(MAX_FILES_DEFAULT));
-  const [report, setReport] = useState<CustodyVerifyReport | null>(null);
-  const [requestedFromNs, setRequestedFromNs] = useState<number | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const [busy, setBusy] = useState(false);
-  const abortRef = useRef<AbortController | null>(null);
-
-  // Don't leave a server-side walk running after the operator navigates away.
-  useEffect(() => () => abortRef.current?.abort(), []);
 
   const { services, failed: servicesFailed } = useServiceNames(true);
 
   // Client-side enforcement of the server bounds (cap 4096 → 400 above).
   const maxFilesNum = Number(maxFiles);
-  const maxFilesValid =
-    Number.isInteger(maxFilesNum) && maxFilesNum >= 1 && maxFilesNum <= MAX_FILES_CAP;
+  const maxFilesValid = Number.isInteger(maxFilesNum) && maxFilesNum >= 1 && maxFilesNum <= MAX_FILES_CAP;
 
-  const run = async (): Promise<void> => {
-    setReport(null);
-    setError(null);
-    setBusy(true);
-    const ctl = new AbortController();
-    abortRef.current = ctl;
-    try {
+  // The hook owns the deadline, so a 60 s timeout now reports as a TIMEOUT.
+  // It used to be caught by `if (ctl.signal.aborted)` and rendered as
+  // "Verify cancelled." — telling the operator they did something they
+  // didn't, on the one surface whose whole job is not misreporting.
+  const verify = useAsyncOp<VerifyResult, [string, string, number]>(
+    async (ctx, chain, fromInput, files) => {
       const body: { chain_id: string; from_ns?: number; max_files?: number } = {
-        chain_id: chainId.trim(),
-        max_files: maxFilesNum,
+        chain_id: chain.trim(),
+        max_files: files,
       };
       let fromNs: number | null = null;
-      if (fromLocal) {
-        const ms = new Date(fromLocal).getTime();
+      if (fromInput) {
+        const ms = new Date(fromInput).getTime();
         if (Number.isFinite(ms)) {
           fromNs = Math.floor(ms * 1e6);
           body.from_ns = fromNs;
@@ -439,7 +411,7 @@ function VerifySection(): ReactElement {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         body: JSON.stringify(body),
-        signal: eitherSignal(ctl.signal, AbortSignal.timeout(VERIFY_TIMEOUT_MS)),
+        signal: ctx.signal,
       });
       if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
       // Shape sentinel: a proxy error page / wrong service on the port must
@@ -454,27 +426,27 @@ function VerifySection(): ReactElement {
       ) {
         throw new Error('malformed verify response (wrong service on the port?)');
       }
-      setRequestedFromNs(fromNs);
-      setReport(parsed as CustodyVerifyReport);
-    } catch (e) {
-      if (ctl.signal.aborted) setError('Verify cancelled.');
-      else setError(String(e));
-    } finally {
-      abortRef.current = null;
-      setBusy(false);
-    }
-  };
+      const full = parsed as CustodyVerifyReport;
+      return {
+        data: { report: full, requestedFromNs: fromNs },
+        receipt: `${full.nodes_verified.toLocaleString()} file${full.nodes_verified === 1 ? '' : 's'} re-hashed`,
+      };
+    },
+    { label: 'Verify', timeoutMs: VERIFY_TIMEOUT_MS }
+  );
+
+  const result = verify.state.data;
 
   return (
     <Box sx={card}>
+      <AsyncOpBar state={verify.state} testId="asyncop-bar-integrity" />
       <Typography variant="h6" sx={{ fontWeight: 600 }}>
         Verify a chain
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-        A chain id is a service name — or <code>service#subshard</code> for a
-        sub-sharded hot service. The walk starts at the chain&apos;s persisted head and
-        re-hashes every claimed file back toward genesis (or your lower bound), reporting
-        the first break.
+        A chain id is a service name — or <code>service#subshard</code> for a sub-sharded hot service. The walk starts
+        at the chain&apos;s persisted head and re-hashes every claimed file back toward genesis (or your lower bound),
+        reporting the first break.
       </Typography>
 
       {services.length > 0 && (
@@ -488,8 +460,7 @@ function VerifySection(): ReactElement {
               sx={mono}
               onClick={() => {
                 setChainId(s);
-                setReport(null);
-                setError(null);
+                verify.reset();
               }}
             />
           ))}
@@ -530,35 +501,34 @@ function VerifySection(): ReactElement {
           sx={{ width: 150 }}
           slotProps={{ htmlInput: { min: 1, max: MAX_FILES_CAP } }}
         />
+        {/* Blocked only by preconditions — never by its own in-flight work.
+            Re-clicking supersedes the running walk. */}
         <Button
           variant="contained"
-          onClick={run}
-          disabled={busy || chainId.trim().length === 0 || !maxFilesValid}
+          onClick={() => verify.run(chainId, fromLocal, maxFilesNum)}
+          disabled={chainId.trim().length === 0 || !maxFilesValid}
+          {...asyncOpTriggerProps(verify.state)}
         >
-          Verify
+          {verify.state.phase === 'running' ? 'Verifying…' : 'Verify'}
         </Button>
-        {busy && (
-          <>
-            <CircularProgress size={18} />
-            <Typography variant="body2" color="text.secondary">
-              Walking the chain — re-hashing every claimed file…
-            </Typography>
-            <Button size="small" onClick={() => abortRef.current?.abort()}>
-              Cancel
-            </Button>
-          </>
-        )}
       </Stack>
+      <AsyncOpStatus
+        id="integrity-verify"
+        state={verify.state}
+        label="Verify"
+        runningHint="Walking the chain — re-hashing every claimed file…"
+        onCancel={verify.cancel}
+      />
 
-      {error && (
+      {verify.state.error !== null && (
         <Alert severity="error" sx={{ mt: 1.5, ...mono, fontSize: 12 }}>
-          {error}
+          {verify.state.error}
         </Alert>
       )}
 
-      {report && (
-        <Box sx={{ mt: 2 }}>
-          <VerdictCard report={report} requestedFromNs={requestedFromNs} />
+      {result && (
+        <Box sx={{ mt: 2, opacity: verify.state.phase === 'running' ? 0.45 : 1 }}>
+          <VerdictCard report={result.report} requestedFromNs={result.requestedFromNs} />
         </Box>
       )}
     </Box>

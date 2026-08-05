@@ -34,6 +34,8 @@ import {
   Tooltip,
   Typography,
 } from '@mui/material';
+import { AsyncOpStatus } from '../../components/progress/AsyncOp';
+import { useTrackedOp } from '../../components/progress/useAsyncOp';
 import { useCapabilities } from '../../hooks/use-capabilities';
 import { dashboardRoute } from '../../model/project';
 import {
@@ -200,6 +202,18 @@ export default function AlertsView(): ReactElement {
 
   const alertsEnabled = !caps.isLoading && !caps.unavailable && caps.alerting;
   const query = useAlerts(status, limit, alertsEnabled);
+  // The refresh/Retry wait gets the same staged disclosure as every other
+  // operation: a bar at 400 ms, elapsed + Cancel at 2 s, a receipt when it
+  // lands. No Cancel here — react-query owns the fetch.
+  const refreshOp = useTrackedOp(query.isFetching, {
+    error: query.isError ? query.error : null,
+    receipt:
+      query.data === undefined
+        ? null
+        : `${query.data.alerts.length} alert${query.data.alerts.length === 1 ? '' : 's'} of ${
+            query.data.total
+          }`,
+  });
 
   const sorted = useMemo(() => {
     const alerts = query.data?.alerts ?? [];
@@ -237,7 +251,14 @@ export default function AlertsView(): ReactElement {
                 label="last refresh failed — showing previous data"
               />
             )}
-            {query.isFetching && query.data !== undefined && <CircularProgress size={16} />}
+            {query.data !== undefined && (
+              <AsyncOpStatus
+                id="alerts-refresh"
+                state={refreshOp}
+                label="Refresh"
+                runningHint="Refreshing alerts…"
+              />
+            )}
             <ToggleButtonGroup
               size="small"
               exclusive

@@ -12,7 +12,6 @@ import {
   Box,
   Button,
   Chip,
-  CircularProgress,
   Dialog,
   DialogActions,
   DialogContent,
@@ -23,6 +22,8 @@ import {
   TextField,
   Typography,
 } from '@mui/material';
+import { AsyncOpBar, AsyncOpStatus } from '../../components/progress/AsyncOp';
+import { useTrackedOp } from '../../components/progress/useAsyncOp';
 import { INSTANCE_TYPES, findInstance } from './instance-types';
 import { ClusterConflictError, useAddNode, useCostPreview } from './use-cluster';
 import { CostPreviewBox } from './CostPreviewBox';
@@ -48,6 +49,9 @@ export function AddNodeDialog({ open, onClose, onLaunched }: AddNodeDialogProps)
 
   const preview = useCostPreview({ action: 'add', instance_type: instanceType }, open);
   const launch = useAddNode();
+  const launchOp = useTrackedOp(launch.isLoading, {
+    receipt: launch.data ? `instance ${launch.data.instance_id} starting` : null,
+  });
 
   const close = (): void => {
     launch.reset();
@@ -109,12 +113,15 @@ export function AddNodeDialog({ open, onClose, onLaunched }: AddNodeDialogProps)
             error={preview.error}
           />
 
-          {launch.isLoading && (
-            <Stack direction="row" alignItems="center" gap={1}>
-              <CircularProgress size={16} />
-              <Typography variant="body2">Requesting launch…</Typography>
-            </Stack>
-          )}
+          {/* A WRITE: elapsed + a receipt, and no Cancel — aborting the
+              fetch would not un-launch an instance. */}
+          <AsyncOpBar state={launchOp} testId="asyncop-bar-launch" />
+          <AsyncOpStatus
+            id="cluster-launch"
+            state={launchOp}
+            label="Launch"
+            runningHint="Requesting launch…"
+          />
           {launch.error instanceof ClusterConflictError && (
             <Alert severity="info" variant="outlined">
               <strong>Provisioning is disabled on this deployment.</strong> The node has no EC2 launch permissions (IAM
