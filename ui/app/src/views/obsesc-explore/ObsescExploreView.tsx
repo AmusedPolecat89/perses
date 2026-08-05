@@ -3,10 +3,13 @@
 // Explore — the dark-data surface. Two ways into the raw tier:
 //
 //   1. SQL over `raw_events` (micro-Athena): estimate-first — every query
-//      gets a cost preview (files after index pruning, bytes, $, seconds)
-//      before it runs, and the server's cost gate (HTTP 402) renders as a
-//      first-class confirmation, not an error. "Keep 100%, query it like
-//      a table; the index is an accelerator, not a gatekeeper."
+//      gets a scan CEILING (files after index pruning, bytes, seconds, and
+//      the scan slots it holds away from ingest) before it runs, and the
+//      server's scan gate (HTTP 412 PRECONDITION_FAILED) renders as a
+//      first-class confirmation, not an error. Nothing here is denominated
+//      in money: scanning is free, OBSESC charges once, on ingest. "Keep
+//      100%, query it like a table; the index is an accelerator, not a
+//      gatekeeper."
 //
 //   2. Needle search: token → bloom-pruned (service, window) candidates →
 //      click through to the verbatim raw event straight off Parquet.
@@ -33,17 +36,106 @@ const card = {
   padding: 2.5,
 } as const;
 
-interface CostPreview {
-  files: number;
-  compressed_bytes: number;
-  decompressed_bytes_estimate: number;
-  cost_usd: number;
-  estimated_seconds: number;
+// ─── The scan wire ─────────────────────────────────────────────────────
+//
+// Every byte field below is a RAW INTEGER and every ceiling is a ceiling,
+// never a forecast — which is why no ceiling is ever rendered without an
+// "up to". There is no money on this wire at all unless an operator
+// configured an internal showback rate, and then `amount` and `label`
+// travel as ONE unit.
+
+type BoundKind = 'scan_bounded' | 'result_bounded' | 'unbounded';
+
+/** How a query's `LIMIT` relates to the bytes the scan must actually read. */
+interface ScanBound {
+  kind: BoundKind;
+  /** The LIMIT's fetch. `null` iff `kind === 'unbounded'`. */
+  max_rows: number | null;
+  offset: number;
+  /** Non-null ONLY for `scan_bounded` (equals `max_rows + offset`). */
+  per_shard_max_rows: number | null;
+  /** True iff the scan itself can stop early. */
+  early_exit: boolean;
+  /** The pipeline breaker standing between the LIMIT and the scan. */
+  blocked_by: string | null;
 }
 
-interface SqlGateResponse {
+/** What the scan costs the write path — the honest answer to "what does
+ *  this query cost me", now that the answer is not a price. */
+interface IngestImpact {
+  scan_slots: number;
+  scan_slots_total: number;
+  scan_slots_inflight: number;
+  competes_with_ingest: boolean;
+  note: string;
+}
+
+/** The ONE monetary object that can appear here, and only when an operator
+ *  configured a rate to cross-charge their own tenants. `amount` without
+ *  `label` misrepresents an internal allocation as an OBSESC price. */
+interface Showback {
+  amount: number;
+  currency: string;
+  rate_per_gib_scanned: number;
+  basis: string;
+  label: string;
+}
+
+/** `POST /v1/sql/estimate` 200, and the `estimate` member of both the run
+ *  envelope and the gate response. */
+interface ScanPreview {
+  scope: 'raw_tier' | 'summary_tier';
+  nodes: number;
+  files_planned: number;
+  /** `null` = UNKNOWN (no survivor carried an access plan), never zero. */
+  rowgroups_planned: number | null;
+  rowgroups_total: number | null;
+  bytes_on_disk_ceiling: number;
+  bytes_decompressed_ceiling: number;
+  decompression_ratio: number;
+  seconds_ceiling: number;
+  bound: ScanBound;
+  ingest_impact: IngestImpact;
+  honesty: string;
+  showback: Showback | null;
+}
+
+/** What the run actually consumed. `rows_scanned` is rows the Parquet scan
+ *  DECODED — never "rows matched", which is a different and smaller number. */
+interface ScanConsumption {
+  scope: string;
+  nodes: number;
+  files_planned: number;
+  files_touched: number;
+  bytes_read: number;
+  rows_scanned: number;
+  rows_returned: number;
+  elapsed_ms: number;
+  rowgroups_pruned_statistics: number;
+  rowgroups_pruned_bloom: number;
+  rows_pruned_pushdown: number;
+  rows_pruned_page_index: number;
+  /** `false` ⇒ the totals are a FLOOR and the note must be rendered. */
+  complete: boolean;
+  note: string;
+  showback: Showback | null;
+}
+
+/** `POST /v1/sql` 200. This used to be a bare row array. */
+interface SqlRunResponse {
+  rows: Array<Record<string, unknown>>;
+  estimate: ScanPreview;
+  consumption: ScanConsumption;
+}
+
+/** `POST /v1/sql` 412 — the precondition the caller supplied was not met. */
+interface ScanGateResponse {
   rejected: boolean;
-  cost: CostPreview;
+  reason: 'max_scan_bytes' | 'max_scan_seconds';
+  limit: number;
+  observed: number;
+  estimate: ScanPreview;
+  /** Server-composed and guaranteed money-free. Rendered verbatim. */
   message: string;
 }
 
@@ -74,10 +166,35 @@ interface RawGrepResponse {
   owners_failed?: number;
 }
 
-function gb(n: number): string {
-  if (n >= 1024 ** 3) return `${(n / 1024 ** 3).toFixed(2)} GB`;
-  if (n >= 1024 ** 2) return `${(n / 1024 ** 2).toFixed(1)} MB`;
-  return `${(n / 1024).toFixed(0)} KB`;
+const BYTE_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'] as const;
+
+/**
+ * Binary units under the labels that actually match them. Mirrors the Rust
+ * `fmt_bytes_binary` exactly — 0 decimals for B and KiB, 1 from MiB up — so
+ * a server-composed gate message and a client-rendered chip can never
+ * disagree. The predecessor of this function divided by 1024³ and labelled
+ * the result "GB" while the server's dollars divided by 1e9: both halves
+ * self-consistent, both labels wrong.
+ */
+function formatBytes(n: number): string {
+  let v = n;
+  let i = 0;
+  while (v >= 1024 && i < BYTE_UNITS.length - 1) {
+    v /= 1024;
+    i += 1;
+  }
+  return `${v.toFixed(i >= 2 ? 1 : 0)} ${BYTE_UNITS[i]!}`;
+}
+
+/**
+ * Mirrors the Rust `fmt_seconds_approx`. Coarse on purpose: the ceiling
+ * rests on a fixed assumed throughput, so more digits would be false
+ * precision dressed up as measurement.
+ */
+function formatSeconds(s: number): string {
+  if (s < 90) return `~${s.toFixed(0)} s`;
+  if (s < 5400) return `~${(s / 60).toFixed(0)} min`;
+  return `~${(s / 3600).toFixed(1)} h`;
 }
 
 function tsPretty(ns: number): string {
@@ -177,10 +294,157 @@ function materialise(sql: string): string {
     .replaceAll('{NOW}', String(Math.floor(now)));
 }
 
-/** Run's result: rows, OR the 402 cost gate — which is a product feature, not an error. */
+/** Run's result: the envelope, OR the 412 scan gate — which is a product
+ *  feature, not an error. */
 interface SqlRunResult {
-  rows: Array<Record<string, unknown>> | null;
-  gate: SqlGateResponse | null;
+  run: SqlRunResponse | null;
+  gate: ScanGateResponse | null;
+}
+
+/**
+ * The bound chip, per the wire contract. `unbounded` earns no chip: there is
+ * nothing to qualify, and an empty qualifier reads as a claim.
+ *
+ * `scan_bounded` and `result_bounded` are NOT the same fact wearing two
+ * names — `SELECT … ORDER BY ts LIMIT 10` returns ten rows and reads every
+ * byte, so saying "row-limited" there would be a new honesty defect in the
+ * opposite direction from the one this lane fixes.
+ */
+function boundChipLabel(b: ScanBound): string | null {
+  if (typeof b.max_rows !== 'number') return null;
+  const rows = b.max_rows.toLocaleString();
+  if (b.kind === 'scan_bounded') return `row-limited to ${rows} — early exit may read far less`;
+  if (b.kind === 'result_bounded') {
+    return `returns ${rows} rows, but ${b.blocked_by ?? 'a pipeline breaker'} forces a full scan`;
+  }
+  return null;
+}
+
+/**
+ * `null` rowgroup counts mean UNKNOWN — no survivor carried a signature
+ * access plan — and unknown is never rendered as zero. The chip earns its
+ * pixels only when the plan actually skips something.
+ */
+function rowgroupChipLabel(p: ScanPreview): string | null {
+  const planned = p.rowgroups_planned;
+  const total = p.rowgroups_total;
+  if (typeof planned !== 'number' || typeof total !== 'number' || planned >= total) return null;
+  return `${(total - planned).toLocaleString()} of ${total.toLocaleString()} rowgroups signature-skipped`;
+}
+
+/** `amount` and `label` are one unit. Rendering the number alone would turn
+ *  an operator's internal allocation into an OBSESC price. */
+function showbackChipLabel(s: Showback): string {
+  return `${s.amount.toFixed(2)} ${s.currency} · ${s.label}`;
+}
+
+/**
+ * The ceiling, in the only denominations that are true: files, bytes, time,
+ * and the ingest headroom the scan holds. No coloured price chip, because
+ * there is no price — the two notes underneath are what replaced it.
+ */
+function ScanCeiling({ preview }: { preview: ScanPreview }): ReactElement {
+  const bound = boundChipLabel(preview.bound);
+  const rowgroups = rowgroupChipLabel(preview);
+  const impact = preview.ingest_impact;
+  return (
+    <Box sx={{ mt: 0.5 }} data-testid="scan-ceiling">
+      <Stack direction="row" gap={1} flexWrap="wrap">
+        <Chip size="small" label={`${preview.files_planned.toLocaleString()} files after pruning`} />
+        <Chip size="small" label={`up to ${formatBytes(preview.bytes_on_disk_ceiling)} on disk`} />
+        <Chip size="small" label={`up to ${formatBytes(preview.bytes_decompressed_ceiling)} decompressed`} />
+        <Chip size="small" label={`up to ${formatSeconds(preview.seconds_ceiling)}`} />
+        {rowgroups !== null && <Chip size="small" variant="outlined" label={rowgroups} />}
+        {bound !== null && <Chip size="small" variant="outlined" label={bound} data-testid="scan-bound-chip" />}
+        <Chip size="small" variant="outlined" label={`${impact.scan_slots} of ${impact.scan_slots_total} scan slots`} />
+        {/* A currency symbol renders ONLY when the operator configured a
+            showback rate. Absent (the default) means no monetary field at
+            all — not a zero, and not a blank. */}
+        {preview.showback && (
+          <Chip
+            size="small"
+            variant="outlined"
+            data-testid="scan-showback"
+            label={showbackChipLabel(preview.showback)}
+          />
+        )}
+      </Stack>
+      {/* The ingest-headroom sentence stands exactly where the price tag
+          used to. It is the honest answer to "what does this cost me": not
+          dollars, but scan slots held away from the write path. */}
+      <Typography
+        variant="caption"
+        color="text.secondary"
+        sx={{ display: 'block', mt: 0.75 }}
+        data-testid="scan-ingest-impact"
+      >
+        {impact.note}
+      </Typography>
+      <Typography
+        variant="caption"
+        color="text.secondary"
+        sx={{ display: 'block', mt: 0.5 }}
+        data-testid="scan-honesty"
+      >
+        {preview.honesty}
+      </Typography>
+    </Box>
+  );
+}
+
+/**
+ * Estimated-vs-actual — the payoff. The ceiling was always going to look
+ * enormous; standing what the run ACTUALLY read next to it is what turns
+ * that from a credibility problem into a demonstration of how hard the
+ * index pruned.
+ */
+function ScanActuals({ run }: { run: SqlRunResponse }): ReactElement {
+  const est = run.estimate;
+  const c = run.consumption;
+  const headline =
+    `estimated up to ${formatBytes(est.bytes_on_disk_ceiling)} · ` +
+    `actually read ${formatBytes(c.bytes_read)} across ` +
+    `${c.files_touched.toLocaleString()} of ${c.files_planned.toLocaleString()} files`;
+  // "rows scanned", never "rows matched": these are rows the Parquet scan
+  // DECODED, before the filter above it re-applied the full predicate.
+  const detail =
+    `${c.rows_scanned.toLocaleString()} rows scanned → ${c.rows_returned.toLocaleString()} returned · ` +
+    `${(c.elapsed_ms / 1000).toFixed(1)} s${c.nodes > 1 ? ` · ${c.nodes} nodes` : ''}`;
+  return (
+    <Box sx={{ mt: 1.5 }}>
+      <Typography variant="body2" sx={{ fontWeight: 600 }} data-testid="scan-actuals">
+        {headline}
+      </Typography>
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }} data-testid="scan-actuals-rows">
+        {detail}
+      </Typography>
+      {c.showback && (
+        <Chip
+          size="small"
+          variant="outlined"
+          sx={{ mt: 0.75 }}
+          data-testid="scan-actuals-showback"
+          label={showbackChipLabel(c.showback)}
+        />
+      )}
+      {c.complete ? (
+        <Typography
+          variant="caption"
+          color="text.secondary"
+          sx={{ display: 'block', mt: 0.5 }}
+          data-testid="scan-consumption-note"
+        >
+          {c.note}
+        </Typography>
+      ) : (
+        // Non-dismissable by construction (no onClose): an incomplete total
+        // that can be closed is an incomplete total that gets quoted.
+        <Alert severity="warning" sx={{ mt: 1 }} data-testid="scan-incomplete">
+          At least one scan reported no metrics, so the totals above are a FLOOR, not the whole story. {c.note}
+        </Alert>
+      )}
+    </Box>
+  );
 }
 
 function SqlSection(): ReactElement {
@@ -190,57 +454,95 @@ function SqlSection(): ReactElement {
   // `busy` token that used to live here is what swallowed Run clicks while
   // an estimate was in flight (U5): Estimate's own state must never be able
   // to disable Run, and neither control is disabled by its own work either.
-  const estimate = useAsyncOp<CostPreview, [string]>(
+  const estimate = useAsyncOp<ScanPreview, [string]>(
     async (ctx, text) => {
       const r = await apiFetch(
         '/v1/sql/estimate',
         {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ sql: text, confirm: false }),
+          // `sql` only: the estimate has nothing to gate, so `confirm` and
+          // the `max_*` ceilings are not accepted there and sending them
+          // would advertise controls that do nothing.
+          body: JSON.stringify({ sql: text }),
         },
         ctx.signal
       );
       if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
-      const cost = (await r.json()) as CostPreview;
+      const parsed = (await r.json()) as Partial<ScanPreview> | null;
+      if (typeof parsed?.bytes_on_disk_ceiling !== 'number' || !parsed.bound || !parsed.ingest_impact) {
+        // Loud schema drift, same reason as the run envelope: rendering a
+        // half-shaped preview would put NaN where a ceiling belongs.
+        throw new Error(
+          'POST /v1/sql/estimate did not return a ScanPreview — this node predates the scan redenomination.'
+        );
+      }
+      const preview = parsed as ScanPreview;
       return {
-        data: cost,
-        receipt: `${cost.files} files after pruning · ~${gb(cost.decompressed_bytes_estimate)} to scan`,
+        data: preview,
+        receipt: `${preview.files_planned.toLocaleString()} files after pruning · up to ${formatBytes(
+          preview.bytes_on_disk_ceiling
+        )} on disk`,
       };
     },
     { label: 'Estimate', timeoutMs: FETCH_TIMEOUT_MS }
   );
 
-  const query = useAsyncOp<SqlRunResult, [string, number | undefined]>(
-    async (ctx, text, maxCostUsd) => {
+  const query = useAsyncOp<SqlRunResult, [string, boolean]>(
+    async (ctx, text, confirm) => {
       const r = await apiFetch(
         '/v1/sql',
         {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ sql: text, confirm: true, max_cost_usd: maxCostUsd }),
+          // NO ceilings on the first Run. A stock node has no gate; a
+          // configured one gates on ITS OWN limits, and the operator's
+          // answer to that is `confirm`, not a number this UI invented.
+          body: JSON.stringify(confirm ? { sql: text, confirm: true } : { sql: text }),
         },
         ctx.signal
       );
-      if (r.status === 402) {
-        // The cost gate resolves as DATA, not an error: the run did exactly
-        // what it was supposed to do.
-        const gated = (await r.json()) as SqlGateResponse;
-        return { data: { rows: null, gate: gated }, receipt: 'stopped by the cost gate' };
+      if (r.status === 412) {
+        // The scan gate resolves as DATA, not an error: the run did exactly
+        // what it was supposed to do. (This was 402 PAYMENT_REQUIRED before
+        // the redenomination — the wrong signal under toll-once pricing,
+        // and invisible to a type checker, so it is pinned by a test.)
+        const gated = (await r.json()) as Partial<ScanGateResponse> | null;
+        if (!gated?.estimate || typeof gated.message !== 'string') {
+          throw new Error('412 from /v1/sql without a ScanGateResponse body — something between here and the node.');
+        }
+        return { data: { run: null, gate: gated as ScanGateResponse }, receipt: 'stopped by the scan gate' };
       }
       if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
-      const got = (await r.json()) as Array<Record<string, unknown>>;
+      const parsed = (await r.json()) as Partial<SqlRunResponse> | null;
+      if (!Array.isArray(parsed?.rows) || !parsed?.estimate || !parsed?.consumption) {
+        // Loud schema drift. /v1/sql used to answer with a BARE row array;
+        // silently rendering nothing would be indistinguishable from an
+        // empty result set, which is the one failure mode this surface
+        // cannot afford.
+        throw new Error(
+          'POST /v1/sql did not return the {rows, estimate, consumption} envelope — this node predates the scan redenomination.'
+        );
+      }
+      const body = parsed as SqlRunResponse;
+      const c = body.consumption;
       return {
-        data: { rows: got, gate: null },
-        receipt: `${got.length} row${got.length === 1 ? '' : 's'}`,
+        data: { run: body, gate: null },
+        receipt: `${body.rows.length} row${body.rows.length === 1 ? '' : 's'} · read ${formatBytes(
+          c.bytes_read
+        )} across ${c.files_touched.toLocaleString()} of ${c.files_planned.toLocaleString()} files`,
       };
     },
     { label: 'Run', timeoutMs: FETCH_TIMEOUT_MS }
   );
 
-  const cost = estimate.state.data;
-  const rows = query.state.data?.rows ?? null;
+  const run = query.state.data?.run ?? null;
   const gate = query.state.data?.gate ?? null;
+  const rows = run?.rows ?? null;
+  // The chips prefer an explicit Estimate — the operator asked for that
+  // one — and otherwise fall back to the preview the run (or the gate)
+  // carried, so a bare Run still shows the ceiling it was measured against.
+  const preview = estimate.state.data ?? run?.estimate ?? gate?.estimate ?? null;
   const columns = useMemo(() => (rows?.length ? Object.keys(rows[0]!) : []), [rows]);
 
   // One bar per region (two stacked bars would reflow); the status row
@@ -260,8 +562,10 @@ function SqlSection(): ReactElement {
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
         Every event you ever ingested is an open Parquet table (<code>raw_events</code>). The summary index prunes the
-        scan; the estimate is the honest cost preview. Row scans gather cluster-wide; aggregates (<code>count</code>/
-        <code>GROUP BY</code>) are node-local today — use the dashboards for cluster-wide aggregates.
+        scan. <strong>Scanning is free — you paid on the way in;</strong> the estimate is a <em>ceiling</em> on what
+        this query would read and how long it holds scan capacity away from ingest. Row scans gather cluster-wide;
+        aggregates (<code>count</code>/<code>GROUP BY</code>) are node-local today — use the dashboards for cluster-wide
+        aggregates.
       </Typography>
       <Stack direction="row" gap={1} sx={{ mb: 1 }}>
         {SQL_PRESETS.map((p) => (
@@ -294,7 +598,7 @@ function SqlSection(): ReactElement {
         <Button variant="outlined" onClick={() => estimate.run(sql)} {...asyncOpTriggerProps(estimate.state)}>
           {estimate.state.phase === 'running' ? 'Estimating…' : 'Estimate'}
         </Button>
-        <Button variant="contained" onClick={() => query.run(sql, undefined)} {...asyncOpTriggerProps(query.state)}>
+        <Button variant="contained" onClick={() => query.run(sql, false)} {...asyncOpTriggerProps(query.state)}>
           {query.state.phase === 'running' ? 'Running…' : 'Run'}
         </Button>
       </Stack>
@@ -307,7 +611,7 @@ function SqlSection(): ReactElement {
           id="sql-estimate"
           state={estimate.state}
           label="Estimate"
-          runningHint="Pruning the summary index for a cost preview…"
+          runningHint="Pruning the summary index for a scan ceiling…"
           onCancel={estimate.cancel}
         />
         <AsyncOpStatus
@@ -319,27 +623,23 @@ function SqlSection(): ReactElement {
           onCancel={query.cancel}
         />
       </Stack>
-      {cost && (
-        <Stack direction="row" gap={1} flexWrap="wrap" sx={{ mt: 0.5 }}>
-          <Chip size="small" label={`${cost.files} files after pruning`} />
-          <Chip size="small" label={`${gb(cost.compressed_bytes)} on disk`} />
-          <Chip size="small" label={`~${gb(cost.decompressed_bytes_estimate)} scanned`} />
-          <Chip size="small" color="primary" label={`$${cost.cost_usd.toFixed(4)}`} />
-          <Chip size="small" label={`~${cost.estimated_seconds.toFixed(1)}s`} />
-        </Stack>
-      )}
+      {preview && <ScanCeiling preview={preview} />}
+      {run && <ScanActuals run={run} />}
 
       {gate && (
         <Alert
           severity="warning"
           sx={{ mt: 1.5 }}
+          data-testid="scan-gate"
           action={
-            <Button color="inherit" size="small" onClick={() => query.run(sql, Math.max(gate.cost.cost_usd * 2, 0.01))}>
-              Confirm &amp; run (~${gate.cost.cost_usd.toFixed(2)})
+            // Resend with `confirm: true` and NO ceilings — the operator is
+            // acknowledging the node's own limit, not naming a new one.
+            <Button color="inherit" size="small" onClick={() => query.run(sql, true)}>
+              Confirm &amp; run (up to {formatBytes(gate.estimate.bytes_on_disk_ceiling)})
             </Button>
           }
         >
-          Cost gate: {gate.message} — {gate.cost.files} files, ~{gb(gate.cost.decompressed_bytes_estimate)} scanned.
+          Scan gate: {gate.message}
         </Alert>
       )}
       {estimate.state.error !== null && (
