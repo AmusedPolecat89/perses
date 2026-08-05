@@ -108,7 +108,7 @@ function parsePrometheus(text: string): NodeStats {
           else stats.walShards.push({ shard: labels.shard, segment: 0, offset: value });
         }
         break;
-      case 'obsesc_wal_committed_bytes':
+      case 'obsesc_wal_committed_bytes_total':
         stats.committedBytesCumulative += value;
         break;
       case 'obsesc_summary_unsummarised_backlog_files':

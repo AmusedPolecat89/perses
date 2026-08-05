@@ -4,8 +4,10 @@
 // "does it work" path; once that's working, operators copy one of
 // these into their telemetry agent's config.
 //
-// Ports come straight from .phase-a/config.yaml and the AMI's
-// production CFN template. Keep these synced if either changes.
+// Ports come from GET /v1/capabilities `ingest_ports` (the node's own
+// config), falling back to the compiled obsesc-config defaults when
+// the node can't answer — with a visible caption so nobody points a
+// shipper at a guessed port.
 
 import { ReactElement } from 'react';
 import {
@@ -18,28 +20,30 @@ import {
   Typography,
 } from '@mui/material';
 import ChevronDown from 'mdi-material-ui/ChevronDown';
+import { DEFAULT_INGEST_PORTS, IngestPorts, useCapabilities } from '../../hooks/use-capabilities';
 
 interface ShipperSnippet {
   id: string;
   name: string;
-  port: number;
+  portKey: keyof IngestPorts;
   description: string;
   language: string;
-  snippet: (host: string) => string;
+  snippet: (host: string, port: number) => string;
 }
 
 const HOST = '<your-obsesc-node>';
 
-const SHIPPERS: ShipperSnippet[] = [
+/** Exported for the unit test (no-hardcoded-ports regression pin). */
+export const SHIPPERS: ShipperSnippet[] = [
   {
     id: 'otlp-http',
     name: 'OTel Collector — OTLP/HTTP',
-    port: 14318,
+    portKey: 'otlp_http',
     description: 'Most universal for OpenTelemetry shops. Protobuf-encoded.',
     language: 'yaml',
-    snippet: (host) => `exporters:
+    snippet: (host, port) => `exporters:
   otlphttp/obsesc:
-    endpoint: http://${host}:14318
+    endpoint: http://${host}:${port}
     encoding: proto
 
 service:
@@ -52,12 +56,12 @@ service:
   {
     id: 'otlp-grpc',
     name: 'OTel Collector — OTLP/gRPC',
-    port: 14317,
+    portKey: 'otlp_grpc',
     description: 'Lower overhead than HTTP for high-cardinality fleets.',
     language: 'yaml',
-    snippet: (host) => `exporters:
+    snippet: (host, port) => `exporters:
   otlp/obsesc:
-    endpoint: ${host}:14317
+    endpoint: ${host}:${port}
     tls:
       insecure: true
 
@@ -69,36 +73,36 @@ service:
   {
     id: 'vector',
     name: 'Vector',
-    port: 9000,
+    portKey: 'vector',
     description: 'Native vector protocol; pairs well with Vector agents already in your fleet.',
     language: 'toml',
-    snippet: (host) => `[sinks.obsesc]
+    snippet: (host, port) => `[sinks.obsesc]
 type = "vector"
 inputs = ["my_logs"]
-address = "${host}:9000"`,
+address = "${host}:${port}"`,
   },
   {
     id: 'es-bulk',
     name: 'Elasticsearch bulk',
-    port: 9200,
+    portKey: 'es_bulk',
     description: 'Drop-in for anything that already speaks ES — Filebeat, Logstash, Fluent-bit ES output.',
     language: 'yaml',
-    snippet: (host) => `# Fluent-bit example
+    snippet: (host, port) => `# Fluent-bit example
 [OUTPUT]
     Name           es
     Match          *
     Host           ${host}
-    Port           9200
+    Port           ${port}
     Index          logs
     Suppress_Type_Name On`,
   },
   {
     id: 'hec',
     name: 'Splunk HEC',
-    port: 18088,
+    portKey: 'hec',
     description: 'For shops migrating off Splunk — same HEC token shape, no app rewrite.',
     language: 'bash',
-    snippet: (host) => `curl -sS -X POST "http://${host}:18088/services/collector" \\
+    snippet: (host, port) => `curl -sS -X POST "http://${host}:${port}/services/collector" \\
   -H "Authorization: Splunk <your-token>" \\
   -H "content-type: application/json" \\
   -d '{ "event": "hello obsesc", "source": "my-app", "host": "my-host" }'`,
@@ -106,20 +110,22 @@ address = "${host}:9000"`,
   {
     id: 'fluent',
     name: 'Fluent Forward',
-    port: 24224,
+    portKey: 'fluent',
     description: 'Native fluentd/fluent-bit forward protocol — binary, low overhead.',
     language: 'conf',
-    snippet: (host) => `<match **>
+    snippet: (host, port) => `<match **>
   @type forward
   <server>
     host ${host}
-    port 24224
+    port ${port}
   </server>
 </match>`,
   },
 ];
 
 export function ShipperConfigs(): ReactElement {
+  const caps = useCapabilities();
+  const ports = caps.ingest_ports ?? DEFAULT_INGEST_PORTS;
   return (
     <Stack gap={2}>
       <Box>
@@ -130,6 +136,12 @@ export function ShipperConfigs(): ReactElement {
           The node exposes six ingest protocols. Pick the one that matches what
           your agents already speak; you can use multiple at once.
         </Typography>
+        {caps.ingest_ports === null && !caps.isLoading && (
+          <Typography variant="caption" color="warning.main">
+            Ports shown are compiled defaults — the node didn&apos;t report its own. Verify the <code>ingest:</code>{' '}
+            section of the node&apos;s config.
+          </Typography>
+        )}
       </Box>
 
       <Stack gap={1}>
@@ -140,7 +152,7 @@ export function ShipperConfigs(): ReactElement {
                 <Typography variant="body1" sx={{ fontWeight: 600 }}>
                   {s.name}
                 </Typography>
-                <Chip size="small" label={`port ${s.port}`} variant="outlined" />
+                <Chip size="small" label={`port ${ports[s.portKey]}`} variant="outlined" />
               </Stack>
             </AccordionSummary>
             <AccordionDetails>
@@ -160,7 +172,7 @@ export function ShipperConfigs(): ReactElement {
                   margin: 0,
                 }}
               >
-                {s.snippet(HOST)}
+                {s.snippet(HOST, ports[s.portKey])}
               </Box>
             </AccordionDetails>
           </Accordion>

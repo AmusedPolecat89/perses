@@ -21,6 +21,35 @@ export interface CapabilityCrosstabPair {
   col: string;
 }
 
+/**
+ * The six shipper-facing ingest ports, as the node's config declares them
+ * (keys mirror the wire's `ingest_ports` object — the `_port` suffix is
+ * dropped since the wrapping key already says it).
+ */
+export interface IngestPorts {
+  otlp_http: number;
+  otlp_grpc: number;
+  vector: number;
+  es_bulk: number;
+  hec: number;
+  fluent: number;
+}
+
+/**
+ * Compiled fallback when the node's real ports are unknown (unreachable,
+ * gated, or malformed response) — mirrors the obsesc-config IngestConfig
+ * defaults. If a Rust default changes, this table must change with it
+ * (pinned by the unit test).
+ */
+export const DEFAULT_INGEST_PORTS: IngestPorts = {
+  otlp_http: 4318,
+  otlp_grpc: 4317,
+  vector: 9000,
+  es_bulk: 9200,
+  hec: 8088,
+  fluent: 24224,
+};
+
 /** Wire shape of GET /v1/capabilities — every field always present. */
 export interface ObsescCapabilities {
   preview: boolean;
@@ -43,6 +72,12 @@ export interface ObsescCapabilities {
      */
     provision: boolean;
   };
+  /**
+   * The node's config-declared shipper ports, or null when unknown
+   * (unreachable node, older node without the field, malformed values) —
+   * consumers fall back to DEFAULT_INGEST_PORTS and say so.
+   */
+  ingest_ports: IngestPorts | null;
 }
 
 export interface CapabilitiesState extends ObsescCapabilities {
@@ -69,6 +104,7 @@ export const DISABLED_CAPABILITIES: CapabilitiesState = {
   alerting: false,
   compaction: false,
   cluster: { enabled: false, routing: 'owner', provision: false },
+  ingest_ports: null,
   unavailable: true,
 };
 
@@ -116,6 +152,26 @@ export function toCapabilitiesState(body: unknown): CapabilitiesState {
   }
   const b = body as Record<string, unknown>;
   const bool = (v: unknown): boolean => v === true;
+  // A real node serializes u16s; anything else is proxy/wrong-service junk.
+  const port = (v: unknown): v is number => typeof v === 'number' && Number.isInteger(v) && v >= 1 && v <= 65535;
+  // All-or-nothing: one bad field nulls the whole object (mixing real node
+  // ports with compiled defaults would be worse than honest defaults). Like
+  // the pairs filtering — and unlike the shape sentinel — this must NOT
+  // throw: a missing/odd ingest_ports can't nuke every other capability.
+  const parseIngestPorts = (v: unknown): IngestPorts | null => {
+    if (typeof v !== 'object' || v === null || Array.isArray(v)) return null;
+    const p = v as Record<string, unknown>;
+    const keys = ['otlp_http', 'otlp_grpc', 'vector', 'es_bulk', 'hec', 'fluent'] as const;
+    if (!keys.every((k) => port(p[k]))) return null;
+    return {
+      otlp_http: p.otlp_http as number,
+      otlp_grpc: p.otlp_grpc as number,
+      vector: p.vector as number,
+      es_bulk: p.es_bulk as number,
+      hec: p.hec as number,
+      fluent: p.fluent as number,
+    };
+  };
   const crosstab = (typeof b.crosstab === 'object' && b.crosstab !== null ? b.crosstab : {}) as Record<string, unknown>;
   const cluster = (typeof b.cluster === 'object' && b.cluster !== null ? b.cluster : {}) as Record<string, unknown>;
   const pairs: CapabilityCrosstabPair[] = Array.isArray(crosstab.pairs)
@@ -142,6 +198,7 @@ export function toCapabilitiesState(body: unknown): CapabilitiesState {
       // Absent on pre-control-plane nodes → false (actions stay gated).
       provision: bool(cluster.provision),
     },
+    ingest_ports: parseIngestPorts(b.ingest_ports),
     unavailable: false,
   };
 }

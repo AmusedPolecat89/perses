@@ -1,9 +1,11 @@
 // Copyright OBSESC Authors
 //
 // Step 1 of onboarding: send a first event so the operator sees the
-// pipeline light up. Uses ES bulk on :9200 because it's the only
-// ingest surface that accepts a plain-JSON curl with no auth headers
-// or protobuf encoding — exactly what bench-soak hits.
+// pipeline light up. Uses ES bulk because it's the only ingest
+// surface that accepts a plain-JSON curl with no auth headers or
+// protobuf encoding — exactly what bench-soak hits. The port comes
+// from the node's own capabilities (config-derived), defaulting to
+// the compiled obsesc-config value when the node can't answer.
 
 import { ReactElement, useEffect, useMemo, useState } from 'react';
 import {
@@ -18,6 +20,7 @@ import {
 import ContentCopy from 'mdi-material-ui/ContentCopy';
 import CheckCircle from 'mdi-material-ui/CheckCircle';
 import { useNodeStats } from '../cluster/use-node-stats';
+import { DEFAULT_INGEST_PORTS, useCapabilities } from '../../hooks/use-capabilities';
 
 // Picked from window.location.hostname so the example "just works"
 // in dev (you opened the UI on the node itself). Operators behind a
@@ -27,19 +30,20 @@ function defaultHostname(): string {
   return window.location.hostname || 'localhost';
 }
 
-const ES_BULK_PORT = 9200;
-
-function buildCurl(host: string): string {
+/** Exported for the unit test (no-hardcoded-ports regression pin). */
+export function buildCurl(host: string, port: number): string {
   // Two-line ES bulk body (action + doc), terminated with a newline
   // — the bulk parser is strict about that.
-  return `curl -sS -X POST "http://${host}:${ES_BULK_PORT}/_bulk" \\
+  return `curl -sS -X POST "http://${host}:${port}/_bulk" \\
   -H "content-type: application/x-ndjson" \\
   --data-binary $'{ "index": { "_index": "logs" } }\\n{ "@timestamp": "'$(date -u +%Y-%m-%dT%H:%M:%SZ)'", "service": "onboarding-demo", "level": "info", "body": "hello obsesc" }\\n'`;
 }
 
 export function CurlSendStep(): ReactElement {
   const [host, setHost] = useState<string>(defaultHostname);
-  const command = useMemo(() => buildCurl(host), [host]);
+  const caps = useCapabilities();
+  const port = caps.ingest_ports?.es_bulk ?? DEFAULT_INGEST_PORTS.es_bulk;
+  const command = useMemo(() => buildCurl(host, port), [host, port]);
   const [copied, setCopied] = useState(false);
 
   const { data: stats } = useNodeStats(3_000);
@@ -93,7 +97,7 @@ export function CurlSendStep(): ReactElement {
           helperText="Auto-detected from this URL. Edit if behind a load balancer."
           sx={{ flex: '0 0 320px' }}
         />
-        <Chip label={`port ${ES_BULK_PORT}`} variant="outlined" />
+        <Chip label={`port ${port}`} variant="outlined" />
       </Stack>
 
       <Box>
@@ -151,8 +155,7 @@ export function CurlSendStep(): ReactElement {
         </Alert>
       ) : (
         <Alert severity="warning" variant="outlined">
-          Waiting for first event… If your curl fails, check that port {ES_BULK_PORT} is
-          open in the node's security group.
+          Waiting for first event… If your curl fails, check that port {port} is open in the node&apos;s security group.
         </Alert>
       )}
     </Stack>

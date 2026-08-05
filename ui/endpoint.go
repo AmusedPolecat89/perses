@@ -52,6 +52,19 @@ var (
 		"/explore",
 		"/profile",
 		"/delegated-auth-error",
+		// OBSESC routes — KEEP IN SYNC with ui/app/src/model/route.ts and
+		// Router.tsx (cluster/onboarding are string literals in Router.tsx,
+		// not route.ts constants). A route missing here direct-loads as a
+		// raw JSON 404 instead of the SPA. Prefix matching is safe against
+		// asset shadowing because prod chunk filenames are numeric
+		// (`[id].[contenthash].js`) — revisit if rspack switches to named
+		// chunks.
+		"/alerts",
+		"/cluster",
+		"/foresight",
+		"/integrity",
+		"/investigate",
+		"/onboarding",
 	}
 	capturingPluginName = regexp.MustCompile(`/plugins/([a-zA-Z0-9_-]+)/?.*`)
 )
