@@ -11,7 +11,6 @@ import {
   Alert,
   Button,
   Checkbox,
-  CircularProgress,
   Dialog,
   DialogActions,
   DialogContent,
@@ -21,6 +20,8 @@ import {
   Stack,
   Typography,
 } from '@mui/material';
+import { AsyncOpBar, AsyncOpStatus } from '../../components/progress/AsyncOp';
+import { useTrackedOp } from '../../components/progress/useAsyncOp';
 import {
   ClusterConflictError,
   ClusterNode,
@@ -46,9 +47,13 @@ export function RemoveNodeDialog({ open, onClose, node, provision }: RemoveNodeD
 
   const preview = useCostPreview({ action: 'remove', node_id: node.id }, open);
   const startDrain = useStartDrain();
+  const startDrainOp = useTrackedOp(startDrain.isLoading);
   // Track the drain whenever the node is mid-lifecycle (not before the
   // operator acts, and not once the node is removed or down).
   const remove = useRemoveNode();
+  const removeOp = useTrackedOp(remove.isLoading, {
+    receipt: remove.data ? `removed at epoch ${remove.data.epoch}` : null,
+  });
   const drainVisible =
     open && !remove.isSuccess && (node.status === 'draining' || startDrain.isSuccess || node.status === 'down');
   const drain = useDrainStatus(node.id, drainVisible && node.status !== 'down');
@@ -99,12 +104,15 @@ export function RemoveNodeDialog({ open, onClose, node, provision }: RemoveNodeD
               </Button>
             </Stack>
           )}
-          {startDrain.isLoading && (
-            <Stack direction="row" alignItems="center" gap={1}>
-              <CircularProgress size={16} />
-              <Typography variant="body2">Starting drain…</Typography>
-            </Stack>
-          )}
+          {/* WRITES: elapsed + a receipt, never a Cancel — aborting the
+              fetch does not un-drain or un-remove a node. */}
+          <AsyncOpBar state={startDrainOp} testId="asyncop-bar-drain" />
+          <AsyncOpStatus
+            id="cluster-drain"
+            state={startDrainOp}
+            label="Drain"
+            runningHint="Starting drain…"
+          />
           {startDrain.error instanceof ClusterConflictError && (
             <Alert severity="info" variant="outlined">
               This is the last active node — the cluster refused to drain it. Add a node first, then retire this one.
@@ -143,6 +151,13 @@ export function RemoveNodeDialog({ open, onClose, node, provision }: RemoveNodeD
             </Typography>
           )}
 
+          <AsyncOpBar state={removeOp} testId="asyncop-bar-remove" />
+          <AsyncOpStatus
+            id="cluster-remove"
+            state={removeOp}
+            label="Remove"
+            runningHint="Removing the node from the manifest…"
+          />
           {remove.error instanceof ClusterConflictError && (
             <Alert severity="info" variant="outlined">
               The cluster refused the removal: {remove.error.message || 'node not drained or last member.'}

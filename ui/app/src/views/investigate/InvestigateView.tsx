@@ -17,18 +17,11 @@
 // the plugin renderer — keep in sync with DiffReportView
 // (ui/plugins/datasource-obsesc/src/plugins/investigate/DiffReportView.tsx).
 
-import { ReactElement, useEffect, useRef, useState } from 'react';
-import {
-  Alert,
-  Box,
-  Button,
-  Chip,
-  CircularProgress,
-  Stack,
-  TextField,
-  Tooltip,
-  Typography,
-} from '@mui/material';
+import { ReactElement, useRef, useState } from 'react';
+import { Alert, Box, Button, Chip, Stack, TextField, Tooltip, Typography } from '@mui/material';
+import { AsyncOpBar, AsyncOpStatus, asyncOpTriggerProps } from '../../components/progress/AsyncOp';
+import { useAsyncOp } from '../../components/progress/useAsyncOp';
+import { eitherSignal } from '../../utils/either-signal';
 
 const API = '/obsesc-api';
 // Cross-node diffs gather from every shard owner — allow the long tail.
@@ -85,9 +78,7 @@ interface DimValueDelta {
   kind: DeltaKind;
 }
 
-type DimensionDelta =
-  | { Full: { attribute: string; values: DimValueDelta[] } }
-  | { Sketched: { attribute: string } };
+type DimensionDelta = { Full: { attribute: string; values: DimValueDelta[] } } | { Sketched: { attribute: string } };
 
 interface CardinalityShift {
   attribute: string;
@@ -182,17 +173,8 @@ function InvestigateView(): ReactElement {
   const [service, setService] = useState('svc-000');
   const [incidentFrom, setIncidentFrom] = useState(nsToLocalInput(nowNs - HOUR_MS * NS_PER_MS));
   const [incidentTo, setIncidentTo] = useState(nsToLocalInput(nowNs));
-  const [baselineFrom, setBaselineFrom] = useState(
-    nsToLocalInput(nowNs - (HOUR_MS + DAY_MS) * NS_PER_MS)
-  );
+  const [baselineFrom, setBaselineFrom] = useState(nsToLocalInput(nowNs - (HOUR_MS + DAY_MS) * NS_PER_MS));
   const [baselineTo, setBaselineTo] = useState(nsToLocalInput(nowNs - DAY_MS * NS_PER_MS));
-
-  const [running, setRunning] = useState(false);
-  const [report, setReport] = useState<DiffReport | null>(null);
-  const [error, setError] = useState<string | null>(null);
-  const abortRef = useRef<AbortController | null>(null);
-
-  useEffect(() => () => abortRef.current?.abort(), []);
 
   const bounds = {
     baseline_from_ns: localInputToNs(baselineFrom),
@@ -214,37 +196,37 @@ function InvestigateView(): ReactElement {
     setBaselineTo(nsToLocalInput(t - DAY_MS * NS_PER_MS));
   };
 
-  const run = async (): Promise<void> => {
-    if (invalid) return;
-    abortRef.current?.abort();
-    const ctl = new AbortController();
-    abortRef.current = ctl;
-    // Wedge rule: the caller's abort AND a hard timeout, whichever first
-    // (the app's TS lib target predates AbortSignal.any — manual bridge).
-    const timeout = setTimeout(() => ctl.abort(), FETCH_TIMEOUT_MS);
-    setRunning(true);
-    setError(null);
-    setReport(null);
-    try {
+  // The hook supplies the generation guard the manual `abortRef.current === ctl`
+  // dance used to approximate, plus elapsed (there was none) and a timeout
+  // that is reported as a timeout rather than as an operator cancel.
+  const diff = useAsyncOp<DiffReport, [string, typeof bounds]>(
+    async (ctx, svc, windows) => {
       const r = await fetch(`${API}/v1/diff`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ service: service.trim(), ...bounds }),
-        signal: ctl.signal,
+        body: JSON.stringify({ service: svc.trim(), ...windows }),
+        // The hook's deadline AND its abort — the hook owns both, so this
+        // composition only exists to keep the fetch honest if a caller ever
+        // threads a second signal.
+        signal: eitherSignal(ctx.signal, AbortSignal.timeout(FETCH_TIMEOUT_MS)),
       });
       if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
-      if (!ctl.signal.aborted) setReport((await r.json()) as DiffReport);
-    } catch (e) {
-      if (!ctl.signal.aborted) setError(String(e));
-    } finally {
-      clearTimeout(timeout);
-      if (abortRef.current === ctl) setRunning(false);
-    }
-  };
+      const report = (await r.json()) as DiffReport;
+      return {
+        data: report,
+        receipt: `${report.template_deltas.length} template delta${report.template_deltas.length === 1 ? '' : 's'}`,
+      };
+    },
+    { label: 'Run diff', timeoutMs: FETCH_TIMEOUT_MS }
+  );
 
-  const cancel = (): void => {
-    abortRef.current?.abort();
-    setRunning(false);
+  const running = diff.state.phase === 'running';
+  const report = diff.state.data;
+  const error = diff.state.error;
+
+  const run = (): void => {
+    if (invalid) return;
+    diff.run(service, bounds);
   };
 
   // Errors here read "Error: 404: no summary data in the baseline window" —
@@ -257,12 +239,12 @@ function InvestigateView(): ReactElement {
         Investigate
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2.5 }}>
-        Differential forensics: pick a broken window and a healthy baseline, hit diff. The
-        comparison runs over the summary sketches in memory — no raw scan, rate-normalized so
-        window sizes don&apos;t have to match.
+        Differential forensics: pick a broken window and a healthy baseline, hit diff. The comparison runs over the
+        summary sketches in memory — no raw scan, rate-normalized so window sizes don&apos;t have to match.
       </Typography>
 
       <Box sx={card}>
+        <AsyncOpBar state={diff.state} testId="asyncop-bar-investigate" />
         <Stack direction="row" gap={2} flexWrap="wrap" alignItems="flex-end">
           <TextField
             label="Service"
@@ -288,36 +270,34 @@ function InvestigateView(): ReactElement {
             ariaPrefix="Incident"
           />
         </Stack>
-        <Stack direction="row" gap={1.5} alignItems="center" sx={{ mt: 2 }}>
-          <Button variant="contained" onClick={run} disabled={running || invalid}>
-            Run diff
+        <Stack direction="row" gap={1.5} alignItems="center" flexWrap="wrap" sx={{ mt: 2 }}>
+          {/* Precondition-only disable: a re-click supersedes the running diff. */}
+          <Button variant="contained" onClick={run} disabled={invalid} {...asyncOpTriggerProps(diff.state)}>
+            {running ? 'Running diff…' : 'Run diff'}
           </Button>
-          <Button variant="outlined" size="small" onClick={suggestBaseline} disabled={running}>
+          <Button variant="outlined" size="small" onClick={suggestBaseline}>
             Suggest baseline (incident −24h)
           </Button>
-          {running && (
-            <>
-              <CircularProgress size={18} />
-              <Typography variant="caption" color="text.secondary">
-                Running diff — cross-node diffs can take a while…
-              </Typography>
-              <Button size="small" color="inherit" onClick={cancel}>
-                Cancel
-              </Button>
-            </>
-          )}
-          {invalid && !running && (
+          {invalid && (
             <Typography variant="caption" color="warning.main">
               service + two valid windows (from &lt; to) required
             </Typography>
           )}
         </Stack>
+        <AsyncOpStatus
+          id="investigate-diff"
+          state={diff.state}
+          label="Run diff"
+          runningHint="Running diff — cross-node diffs gather from every shard owner…"
+          idleHint="No diff run yet — set the windows and hit Run diff."
+          onCancel={diff.cancel}
+        />
       </Box>
 
       {emptyWindow && (
         <Alert severity="info" sx={{ mt: 2 }}>
-          No summary data in one of the windows — widen a window or move the baseline to a period
-          this node has data for.
+          No summary data in one of the windows — widen a window or move the baseline to a period this node has data
+          for.
         </Alert>
       )}
       {error && !emptyWindow && (
@@ -325,13 +305,11 @@ function InvestigateView(): ReactElement {
           {error}
         </Alert>
       )}
-      {!running && !error && !report && (
-        <Typography variant="body2" color="text.secondary" sx={{ mt: 2 }}>
-          No diff run yet — set the windows and hit Run diff.
-        </Typography>
+      {report && (
+        <Box sx={{ opacity: running ? 0.45 : 1 }} aria-busy={running}>
+          <ReportView report={report} />
+        </Box>
       )}
-
-      {report && <ReportView report={report} />}
     </Box>
   );
 }

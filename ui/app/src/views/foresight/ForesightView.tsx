@@ -35,8 +35,11 @@ import {
   Typography,
 } from '@mui/material';
 import { useCapabilities } from '../../hooks/use-capabilities';
+import { AsyncOpBar, AsyncOpStatus, asyncOpTriggerProps } from '../../components/progress/AsyncOp';
+import { useAsyncOp } from '../../components/progress/useAsyncOp';
 import {
   DEFAULT_TOP,
+  FETCH_TIMEOUT_MS,
   fetchForecast,
   fetchWhatIf,
   MAX_HISTORY_RANGE_SECONDS,
@@ -194,25 +197,7 @@ function LowSupportChip({ floor }: { floor: number }): ReactElement {
 
 // ─── Forecast section ──────────────────────────────────────────────────
 
-function ForecastSection({
-  resp,
-  error,
-  busy,
-}: {
-  resp: ObsescForecastResponse | null;
-  error: string | null;
-  busy: boolean;
-}): ReactElement {
-  if (busy) {
-    return (
-      <Stack direction="row" gap={1} alignItems="center" sx={{ mt: 2 }}>
-        <CircularProgress size={18} />
-        <Typography variant="body2" color="text.secondary">
-          gathering transition matrices…
-        </Typography>
-      </Stack>
-    );
-  }
+function ForecastSection({ resp, error }: { resp: ObsescForecastResponse | null; error: string | null }): ReactElement {
   if (error) {
     return (
       <Alert severity="error" sx={{ mt: 2, ...mono, fontSize: 12 }}>
@@ -358,25 +343,7 @@ function WhatIfPath({ hit, floor }: { hit: ObsescWhatIfHit; floor: number }): Re
   );
 }
 
-function WhatIfSection({
-  resp,
-  error,
-  busy,
-}: {
-  resp: ObsescWhatIfResponse | null;
-  error: string | null;
-  busy: boolean;
-}): ReactElement {
-  if (busy) {
-    return (
-      <Stack direction="row" gap={1} alignItems="center" sx={{ mt: 2 }}>
-        <CircularProgress size={18} />
-        <Typography variant="body2" color="text.secondary">
-          propagating state through the transition graph…
-        </Typography>
-      </Stack>
-    );
-  }
+function WhatIfSection({ resp, error }: { resp: ObsescWhatIfResponse | null; error: string | null }): ReactElement {
   if (error) {
     return (
       <Alert severity="error" sx={{ mt: 2, ...mono, fontSize: 12 }}>
@@ -429,87 +396,47 @@ export default function ForesightView(): ReactElement {
   const [rangeSecs, setRangeSecs] = useState(24 * 3600);
   const [steps, setSteps] = useState(4);
 
-  const [forecastResp, setForecastResp] = useState<ObsescForecastResponse | null>(null);
-  const [forecastError, setForecastError] = useState<string | null>(null);
-  const [forecastBusy, setForecastBusy] = useState(false);
+  // TWO hook instances replace the `beginRequest` double-flag dance: that
+  // existed only because ONE inflight ref served two independent ops, so a
+  // superseded request could never clear its own busy flag. Each op now
+  // owns its own generation, deadline and Cancel.
+  const forecast = useAsyncOp<ObsescForecastResponse, [string, number]>(
+    async (ctx, svc, secs) => {
+      const { from_ns, to_ns } = rangeNs(secs);
+      const resp = await fetchForecast({ service: svc, from_ns, to_ns, top: DEFAULT_TOP }, ctx.signal);
+      return {
+        data: resp,
+        receipt: `${resp.predictions.length} prediction${resp.predictions.length === 1 ? '' : 's'}`,
+      };
+    },
+    { label: 'Forecast', timeoutMs: FETCH_TIMEOUT_MS }
+  );
 
-  const [whatifResp, setWhatifResp] = useState<ObsescWhatIfResponse | null>(null);
-  const [whatifError, setWhatifError] = useState<string | null>(null);
-  const [whatifBusy, setWhatifBusy] = useState(false);
-
-  // One in-flight request at a time: a new run — or any input change —
-  // aborts the previous one (wedge rule: thread AbortController). Input
-  // changes also clear previous results/errors: stale predictions must
-  // never sit under a new service/range/steps selection.
-  const inflight = useRef<AbortController | null>(null);
-  useEffect(() => {
-    inflight.current?.abort();
-    inflight.current = null;
-    setForecastBusy(false);
-    setWhatifBusy(false);
-    setForecastResp(null);
-    setForecastError(null);
-    setWhatifResp(null);
-    setWhatifError(null);
-  }, [service, rangeSecs, steps]);
-  useEffect(() => {
-    return (): void => inflight.current?.abort();
-  }, []);
-
-  const beginRequest = (): AbortController => {
-    inflight.current?.abort();
-    // The superseded request's finally guard (`inflight.current === ctl`)
-    // goes false the moment the new controller is installed, so it can
-    // never clear its own busy flag — clear BOTH busy flags here; the
-    // caller re-sets its own immediately after.
-    setForecastBusy(false);
-    setWhatifBusy(false);
-    const ctl = new AbortController();
-    inflight.current = ctl;
-    return ctl;
-  };
-
-  const runForecast = async (): Promise<void> => {
-    const ctl = beginRequest();
-    setForecastResp(null);
-    setForecastError(null);
-    setForecastBusy(true);
-    try {
-      const { from_ns, to_ns } = rangeNs(rangeSecs);
-      const resp = await fetchForecast({ service, from_ns, to_ns, top: DEFAULT_TOP }, ctl.signal);
-      if (ctl.signal.aborted) return;
-      setForecastResp(resp);
-    } catch (e) {
-      if (!ctl.signal.aborted) setForecastError(String(e));
-    } finally {
-      if (inflight.current === ctl) {
-        inflight.current = null;
-        setForecastBusy(false);
-      }
-    }
-  };
-
-  const runWhatIf = async (): Promise<void> => {
-    const ctl = beginRequest();
-    setWhatifResp(null);
-    setWhatifError(null);
-    setWhatifBusy(true);
-    try {
-      const { from_ns, to_ns } = rangeNs(rangeSecs);
+  const whatif = useAsyncOp<ObsescWhatIfResponse, [string, number, number]>(
+    async (ctx, svc, secs, depth) => {
+      const { from_ns, to_ns } = rangeNs(secs);
       // steps is slider-bounded 1..=16 — the server 400s outside.
-      const bounded = Math.max(1, Math.min(MAX_WHATIF_STEPS, steps));
-      const resp = await fetchWhatIf({ service, from_ns, to_ns, steps: bounded, top: DEFAULT_TOP }, ctl.signal);
-      if (ctl.signal.aborted) return;
-      setWhatifResp(resp);
-    } catch (e) {
-      if (!ctl.signal.aborted) setWhatifError(String(e));
-    } finally {
-      if (inflight.current === ctl) {
-        inflight.current = null;
-        setWhatifBusy(false);
-      }
-    }
-  };
+      const bounded = Math.max(1, Math.min(MAX_WHATIF_STEPS, depth));
+      const resp = await fetchWhatIf({ service: svc, from_ns, to_ns, steps: bounded, top: DEFAULT_TOP }, ctx.signal);
+      return { data: resp, receipt: `${resp.hits.length} path${resp.hits.length === 1 ? '' : 's'}` };
+    },
+    { label: 'What-if', timeoutMs: FETCH_TIMEOUT_MS }
+  );
+
+  // Stricter than the progress pattern needs, and deliberately kept: stale
+  // predictions must never sit under a new service/range/steps selection —
+  // that is an honesty issue, not a UX one.
+  const resetOps = useRef({ forecast: forecast.reset, whatif: whatif.reset });
+  resetOps.current = { forecast: forecast.reset, whatif: whatif.reset };
+  useEffect(() => {
+    resetOps.current.forecast();
+    resetOps.current.whatif();
+  }, [service, rangeSecs, steps]);
+
+  const forecastResp = forecast.state.data;
+  const forecastError = forecast.state.error;
+  const whatifResp = whatif.state.data;
+  const whatifError = whatif.state.error;
 
   // ── Tri-state gating (PR standard 4): loading ≠ unreachable ≠ disabled ──
   let gate: ReactElement | null = null;
@@ -589,24 +516,36 @@ export default function ForesightView(): ReactElement {
 
           {tab === 'forecast' && (
             <Box sx={{ mt: 1.5 }}>
-              <Stack direction="row" gap={1.5} alignItems="center">
+              <AsyncOpBar state={forecast.state} testId="asyncop-bar-forecast" />
+              <Stack direction="row" gap={1.5} alignItems="center" flexWrap="wrap">
                 <Button
                   variant="contained"
-                  onClick={runForecast}
-                  disabled={forecastBusy || service.trim().length === 0}
+                  onClick={() => forecast.run(service, rangeSecs)}
+                  disabled={service.trim().length === 0}
+                  {...asyncOpTriggerProps(forecast.state)}
                 >
-                  Forecast
+                  {forecast.state.phase === 'running' ? 'Forecasting…' : 'Forecast'}
                 </Button>
                 <Typography variant="caption" color="text.secondary">
                   top {DEFAULT_TOP} next templates from the current state
                 </Typography>
               </Stack>
-              <ForecastSection resp={forecastResp} error={forecastError} busy={forecastBusy} />
+              <AsyncOpStatus
+                id="foresight-forecast"
+                state={forecast.state}
+                label="Forecast"
+                runningHint="Gathering transition matrices…"
+                onCancel={forecast.cancel}
+              />
+              <Box sx={{ opacity: forecast.state.phase === 'running' ? 0.45 : 1 }}>
+                <ForecastSection resp={forecastResp} error={forecastError} />
+              </Box>
             </Box>
           )}
 
           {tab === 'whatif' && (
             <Box sx={{ mt: 1.5 }}>
+              <AsyncOpBar state={whatif.state} testId="asyncop-bar-whatif" />
               <Stack direction="row" gap={2.5} alignItems="center" flexWrap="wrap">
                 <Box sx={{ width: 260 }}>
                   <Typography variant="caption" color="text.secondary">
@@ -625,11 +564,25 @@ export default function ForesightView(): ReactElement {
                     aria-label="propagation depth in steps"
                   />
                 </Box>
-                <Button variant="contained" onClick={runWhatIf} disabled={whatifBusy || service.trim().length === 0}>
-                  Explore failure paths
+                <Button
+                  variant="contained"
+                  onClick={() => whatif.run(service, rangeSecs, steps)}
+                  disabled={service.trim().length === 0}
+                  {...asyncOpTriggerProps(whatif.state)}
+                >
+                  {whatif.state.phase === 'running' ? 'Exploring…' : 'Explore failure paths'}
                 </Button>
               </Stack>
-              <WhatIfSection resp={whatifResp} error={whatifError} busy={whatifBusy} />
+              <AsyncOpStatus
+                id="foresight-whatif"
+                state={whatif.state}
+                label="What-if"
+                runningHint="Propagating state through the transition graph…"
+                onCancel={whatif.cancel}
+              />
+              <Box sx={{ opacity: whatif.state.phase === 'running' ? 0.45 : 1 }}>
+                <WhatIfSection resp={whatifResp} error={whatifError} />
+              </Box>
             </Box>
           )}
         </Box>
