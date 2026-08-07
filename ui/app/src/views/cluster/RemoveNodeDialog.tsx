@@ -177,7 +177,7 @@ export function RemoveNodeDialog({ open, onClose, node, provision }: RemoveNodeD
         </Stack>
       </DialogContent>
       <DialogActions>
-        <Button onClick={close} color="inherit">
+        <Button onClick={close} color="inherit" data-testid="remove-node-dismiss-btn">
           {remove.data ? 'Close' : 'Cancel'}
         </Button>
         {!remove.data && (

@@ -143,7 +143,9 @@ export function AddNodeDialog({ open, onClose, onLaunched }: AddNodeDialogProps)
         </Stack>
       </DialogContent>
       <DialogActions>
-        <Button onClick={close} color="inherit">
+        {/* Cancel becomes Close once the launch lands — same stale-locator
+            class as the Run/Estimate flip, so it carries a stable handle. */}
+        <Button onClick={close} color="inherit" data-testid="add-node-dismiss-btn">
           {launch.data ? 'Close' : 'Cancel'}
         </Button>
         {!launch.data && (

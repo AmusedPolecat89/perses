@@ -1180,8 +1180,15 @@ function NeedleSection(): ReactElement {
           slotProps={{ input: { sx: mono } }}
         />
         {/* Blocked only by a PRECONDITION, never by in-flight work — and the
-            reason is rendered next to it instead of left mute. */}
-        <Button variant="contained" onClick={runSearch} disabled={tokenTooShort} {...asyncOpTriggerProps(search.state)}>
+            reason is rendered next to it instead of left mute. data-testid for
+            the same reason as Estimate/Run above: the label flips on click. */}
+        <Button
+          variant="contained"
+          data-testid="needle-search-btn"
+          onClick={runSearch}
+          disabled={tokenTooShort}
+          {...asyncOpTriggerProps(search.state)}
+        >
           {search.state.phase === 'running' ? 'Searching…' : 'Search'}
         </Button>
         {tokenTooShort && (

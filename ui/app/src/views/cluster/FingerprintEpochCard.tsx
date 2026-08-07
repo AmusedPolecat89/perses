@@ -356,7 +356,7 @@ function MintEpochDialog({ open, onClose, onMinted }: MintEpochDialogProps): Rea
         </Stack>
       </DialogContent>
       <DialogActions>
-        <Button onClick={close} color="inherit">
+        <Button onClick={close} color="inherit" data-testid="fingerprint-epoch-dismiss-btn">
           {mint.data ? 'Close' : 'Cancel'}
         </Button>
         {!mint.data && (
