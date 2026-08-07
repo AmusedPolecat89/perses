@@ -38,7 +38,14 @@ export default function Header(): JSX.Element {
   const { isComplete: onboardingComplete } = useOnboarded();
 
   return (
-    <AppBar position="relative">
+    // U14: `position="relative"` scrolled the whole nav out of reach on any
+    // route tall enough for the DOCUMENT to scroll — which on a dashboard is
+    // every route, because the dashboard grid grows the page rather than
+    // scrolling inside itself. Crossing from a dashboard to another section
+    // then needed a scroll-to-top or a URL edit. Sticky pins it identically
+    // on every route; `top: 0` and the appBar z-index keep it above the
+    // dashboard's own sticky variable row.
+    <AppBar position="sticky" sx={{ top: 0, zIndex: (theme) => theme.zIndex.appBar }}>
       <Toolbar
         sx={{
           backgroundColor: (theme) => theme.palette.background.navigation,
