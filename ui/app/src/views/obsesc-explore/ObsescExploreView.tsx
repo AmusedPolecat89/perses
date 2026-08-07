@@ -704,10 +704,25 @@ function SqlSection(): ReactElement {
           the pointer is travelling toward them — a click lost to layout
           shift has the same "nothing happened" signature as U5. */}
       <Stack direction="row" gap={1.5} alignItems="center" flexWrap="wrap" sx={{ mt: 1.5 }}>
-        <Button variant="outlined" onClick={() => estimate.run(sql)} {...asyncOpTriggerProps(estimate.state)}>
+        {/* data-testid, NOT aria-label: the visible label deliberately changes
+            with phase and a screen reader should announce that change, so the
+            accessible name must stay the live text. Tests need a handle that
+            does not move — an exact-name locator goes stale the instant the
+            label flips, which reads as "the control vanished". */}
+        <Button
+          variant="outlined"
+          data-testid="sql-estimate-btn"
+          onClick={() => estimate.run(sql)}
+          {...asyncOpTriggerProps(estimate.state)}
+        >
           {estimate.state.phase === 'running' ? 'Estimating…' : 'Estimate'}
         </Button>
-        <Button variant="contained" onClick={() => query.run(sql, false)} {...asyncOpTriggerProps(query.state)}>
+        <Button
+          variant="contained"
+          data-testid="sql-run-btn"
+          onClick={() => query.run(sql, false)}
+          {...asyncOpTriggerProps(query.state)}
+        >
           {query.state.phase === 'running' ? 'Running…' : 'Run'}
         </Button>
         {/* The explicit escape hatch for a hand-edited query: re-resolve the
