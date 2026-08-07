@@ -17,11 +17,27 @@
 // Fetches go straight to /obsesc-api (same pattern as use-node-stats):
 // this surface must work on a fresh node before any datasource exists.
 
-import { Fragment, ReactElement, ReactNode, useMemo, useState } from 'react';
-import { Alert, Box, Button, Chip, MenuItem, Stack, TextField, Typography } from '@mui/material';
+import { Fragment, ReactElement, ReactNode, useEffect, useMemo, useRef, useState } from 'react';
+import { Alert, Box, Button, Chip, Stack, TextField, Tooltip, Typography } from '@mui/material';
+import ChevronRight from 'mdi-material-ui/ChevronRight';
+import ChevronDown from 'mdi-material-ui/ChevronDown';
 import { AsyncOpBar, AsyncOpStatus, asyncOpTriggerProps } from '../../components/progress/AsyncOp';
 import { useAsyncOp } from '../../components/progress/useAsyncOp';
 import { eitherSignal } from '../../utils/either-signal';
+import { TimeRangeControl } from '../../components/TimeRangeControl';
+import { useSharedTimeRange } from '../../hooks/use-shared-time-range';
+import { ResolvedRange, isoSeconds, rangeKey, rangeLabel, resolveRange } from '../../model/time-range';
+import {
+  NeedleGroup,
+  NeedleRun,
+  NeedleSignal,
+  SIGNAL_EXPLAIN,
+  SIGNAL_LABEL,
+  TokenWindow,
+  groupNeedleWindows,
+  signalTally,
+  startHere,
+} from './needle-ranking';
 
 const API = '/obsesc-api';
 const FETCH_TIMEOUT_MS = 60_000;
@@ -139,14 +155,15 @@ interface ScanGateResponse {
   message: string;
 }
 
-interface TokenWindow {
-  service: string;
-  window_start_ns: number;
-  window_end_ns: number;
-  windows_merged: number;
-  event_count: number;
-  bloom_match: boolean;
-  saturated: boolean;
+/** Probe transparency from the bit-sliced needle index (`NeedleStats`). */
+interface NeedleStats {
+  slabs_probed: number;
+  manifests_probed: number;
+  probe_bytes: number;
+  covered_files: number;
+  unindexed_files: number;
+  listing_failed: boolean;
+  manifest_budget_exhausted?: boolean;
 }
 
 interface RawEventJson {
@@ -260,15 +277,15 @@ async function apiFetch(path: string, init?: RequestInit, signal?: AbortSignal):
 const SQL_PRESETS: Array<{ label: string; sql: string }> = [
   {
     label: 'sample rows',
-    sql: 'SELECT timestamp_ns, service, body FROM raw_events\nWHERE timestamp_ns >= {NOW_MINUS_1H} AND timestamp_ns < {NOW}\nLIMIT 10',
+    sql: 'SELECT timestamp_ns, service, body FROM raw_events\nWHERE timestamp_ns >= {FROM_NS} AND timestamp_ns < {TO_NS}\nLIMIT 10',
   },
   {
     label: 'grep bodies',
-    sql: "SELECT timestamp_ns, service, body FROM raw_events\nWHERE timestamp_ns >= {NOW_MINUS_1H} AND timestamp_ns < {NOW}\n  AND body LIKE '%vault%'\nLIMIT 20",
+    sql: "SELECT timestamp_ns, service, body FROM raw_events\nWHERE timestamp_ns >= {FROM_NS} AND timestamp_ns < {TO_NS}\n  AND body LIKE '%vault%'\nLIMIT 20",
   },
   {
     label: 'one service',
-    sql: "SELECT timestamp_ns, body FROM raw_events\nWHERE timestamp_ns >= {NOW_MINUS_1H} AND timestamp_ns < {NOW}\n  AND service = 'svc-b'\nLIMIT 20",
+    sql: "SELECT timestamp_ns, body FROM raw_events\nWHERE timestamp_ns >= {FROM_NS} AND timestamp_ns < {TO_NS}\n  AND service = 'svc-b'\nLIMIT 20",
   },
   // Virtual columns (Lane H): template_keys(service, from_ns, to_ns) lists
   // every TemplateKey observed in the window (summary tier only — no raw
@@ -279,19 +296,70 @@ const SQL_PRESETS: Array<{ label: string; sql: string }> = [
   // template_keys() prints it. Both are capped server-side at a 7-day window.
   {
     label: 'template keys',
-    sql: "SELECT template_key, pattern, events, windows, wildcards, similar_group\nFROM template_keys('svc-000', {NOW_MINUS_1H}, {NOW})\nLIMIT 50",
+    sql: "SELECT template_key, pattern, events, windows, wildcards, similar_group\nFROM template_keys('svc-000', {FROM_NS}, {TO_NS})\nLIMIT 50",
   },
   {
     label: 'template events',
-    sql: "-- paste a template_key from the 'template keys' preset\nSELECT * FROM template_events('svc-000', '<template_key>', {NOW_MINUS_1H}, {NOW})\nLIMIT 20",
+    sql: "-- paste a template_key from the 'template keys' preset\nSELECT * FROM template_events('svc-000', '<template_key>', {FROM_NS}, {TO_NS})\nLIMIT 20",
   },
 ];
 
-function materialise(sql: string): string {
-  const now = Date.now() * 1e6;
-  return sql
-    .replaceAll('{NOW_MINUS_1H}', String(Math.floor(now - 3600e9)))
-    .replaceAll('{NOW}', String(Math.floor(now)));
+function materialise(sql: string, r: ResolvedRange): string {
+  return sql.replaceAll('{FROM_NS}', String(r.fromNs)).replaceAll('{TO_NS}', String(r.toNs));
+}
+
+// ─── the time control writes the bounds (U10) ──────────────────────────
+//
+// `timestamp_ns >= 1785824670563000000` is not something a human can edit to
+// mean "the last six hours", so the epoch-ns literals stop being something a
+// human is expected to touch: the shared time control OWNS them and rewrites
+// them in place. The rewrite is textual and deliberately narrow — it only
+// claims the two positions where a nanosecond literal can only be a time
+// bound:
+//
+//   1. a numeric comparison against the `timestamp_ns` column, and
+//   2. the LAST TWO arguments of `template_keys(…)` / `template_events(…)`,
+//      which are that function's `from_ns, to_ns` pair.
+//
+// A 13-digit floor keeps it off ordinary integers (a LIMIT, a status code, a
+// port). A `template_key` literal is the same digit-class, which is why the
+// virtual-column rule anchors on the closing paren: a quoted key is followed
+// by a quote, never by the `, <digits>)` the pattern requires. Anything the
+// rewrite does not recognise it does not touch, and it reports how many
+// literals it changed so "nothing happened" is never silent.
+
+/** ns-scale literal: 13+ digits (epoch ms ≈ 13, epoch ns ≈ 19). */
+const NS_LITERAL = String.raw`\d{13,}`;
+const TS_BOUND_RE = new RegExp(String.raw`(timestamp_ns\s*(?:>=|<=|>|<)\s*)(${NS_LITERAL})`, 'g');
+const VCOL_WINDOW_RE = new RegExp(
+  String.raw`(template_(?:keys|events)\s*\([^)]*?)(${NS_LITERAL})(\s*,\s*)(${NS_LITERAL})(\s*\))`,
+  'g'
+);
+
+export interface SqlRewrite {
+  sql: string;
+  /** Literals actually changed. `0` ⇒ this query has no bound to own. */
+  rewrote: number;
+}
+
+export function applyRangeToSql(sql: string, fromNs: number, toNs: number): SqlRewrite {
+  let rewrote = 0;
+  const swap = (was: string, now: string): string => {
+    if (was !== now) rewrote += 1;
+    return now;
+  };
+  let out = sql.replace(TS_BOUND_RE, (_m, lead: string, literal: string) => {
+    // `>=` / `>` is the lower bound; `<=` / `<` the upper. The operator is
+    // inside `lead`, so reading it back is exact rather than positional.
+    const upper = lead.includes('<');
+    return lead + swap(literal, String(upper ? toNs : fromNs));
+  });
+  out = out.replace(
+    VCOL_WINDOW_RE,
+    (_m, lead: string, from: string, sep: string, to: string, tail: string) =>
+      lead + swap(from, String(fromNs)) + sep + swap(to, String(toNs)) + tail
+  );
+  return { sql: out, rewrote };
 }
 
 /** Run's result: the envelope, OR the 412 scan gate — which is a product
@@ -448,7 +516,34 @@ function ScanActuals({ run }: { run: SqlRunResponse }): ReactElement {
 }
 
 function SqlSection(): ReactElement {
-  const [sql, setSql] = useState(materialise(SQL_PRESETS[0]!.sql));
+  // U10/U11: the shared range OWNS the epoch-ns bounds in this box. It is
+  // resolved once per range change (not per render) so the text does not
+  // churn under the cursor while the operator is editing it.
+  const { range } = useSharedTimeRange();
+  const rangeK = rangeKey(range);
+  const [sql, setSql] = useState(() => materialise(SQL_PRESETS[0]!.sql, resolveRange(range, Date.now())));
+  const [lastRewrite, setLastRewrite] = useState<number | null>(null);
+  const appliedRange = useRef(rangeK);
+  // The editor's live text, readable from an effect without making that
+  // effect fire on every keystroke.
+  const sqlRef = useRef(sql);
+  sqlRef.current = sql;
+
+  const reapplyRange = (): void => {
+    const r = resolveRange(range, Date.now());
+    const next = applyRangeToSql(sqlRef.current, r.fromNs, r.toNs);
+    setSql(next.sql);
+    setLastRewrite(next.rewrote);
+  };
+
+  useEffect(() => {
+    if (appliedRange.current === rangeK) return;
+    appliedRange.current = rangeK;
+    reapplyRange();
+    // `range` is fully described by `rangeK`; depending on the object itself
+    // would re-run this on every render of a relative range.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [rangeK]);
 
   // TWO independent operations, TWO hook instances. The single shared
   // `busy` token that used to live here is what swallowed Run clicks while
@@ -536,6 +631,10 @@ function SqlSection(): ReactElement {
     { label: 'Run', timeoutMs: FETCH_TIMEOUT_MS }
   );
 
+  // What the caption states the query's window IS. One clock reading, so the
+  // two ends of the sentence cannot straddle a millisecond boundary.
+  const shown = resolveRange(range, Date.now());
+
   const run = query.state.data?.run ?? null;
   const gate = query.state.data?.gate ?? null;
   const rows = run?.rows ?? null;
@@ -567,7 +666,7 @@ function SqlSection(): ReactElement {
         aggregates (<code>count</code>/<code>GROUP BY</code>) are node-local today — use the dashboards for cluster-wide
         aggregates.
       </Typography>
-      <Stack direction="row" gap={1} sx={{ mb: 1 }}>
+      <Stack direction="row" gap={1} sx={{ mb: 1 }} flexWrap="wrap">
         {SQL_PRESETS.map((p) => (
           <Chip
             key={p.label}
@@ -575,7 +674,8 @@ function SqlSection(): ReactElement {
             size="small"
             variant="outlined"
             onClick={() => {
-              setSql(materialise(p.sql));
+              setSql(materialise(p.sql, resolveRange(range, Date.now())));
+              setLastRewrite(null);
               reset();
             }}
           />
@@ -591,6 +691,15 @@ function SqlSection(): ReactElement {
         slotProps={{ input: { sx: { ...mono, fontSize: 13 } } }}
         aria-label="SQL query"
       />
+      {/* The epoch-ns literals above, in words. Nobody can check
+          `1785824670563000000` by eye; this is the line that makes the
+          query's window legible (U10). */}
+      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }} data-testid="sql-window">
+        Time range writes the <code>timestamp_ns</code> bounds — {rangeLabel(range)}: {isoSeconds(shown.fromMs)} →{' '}
+        {isoSeconds(shown.toMs)} UTC
+        {lastRewrite === 0 && ' · nothing to rewrite: this query has no timestamp_ns bound'}
+        {lastRewrite !== null && lastRewrite > 0 && ` · rewrote ${lastRewrite} bound${lastRewrite === 1 ? '' : 's'}`}
+      </Typography>
       {/* flexWrap: the row must never squeeze its own buttons narrower while
           the pointer is travelling toward them — a click lost to layout
           shift has the same "nothing happened" signature as U5. */}
@@ -600,6 +709,12 @@ function SqlSection(): ReactElement {
         </Button>
         <Button variant="contained" onClick={() => query.run(sql, false)} {...asyncOpTriggerProps(query.state)}>
           {query.state.phase === 'running' ? 'Running…' : 'Run'}
+        </Button>
+        {/* The explicit escape hatch for a hand-edited query: re-resolve the
+            shared range and stamp it back over the bounds. Reports the count
+            so "it did nothing" is never left to inference. */}
+        <Button variant="text" size="small" onClick={reapplyRange}>
+          Reapply time range
         </Button>
       </Stack>
       {/* The reserved status slot: entering/leaving the running state costs
@@ -703,13 +818,6 @@ function SqlSection(): ReactElement {
 
 // ─── Needle search ─────────────────────────────────────────────────────
 
-const RANGES: Array<{ label: string; seconds: number }> = [
-  { label: 'Last 15 minutes', seconds: 15 * 60 },
-  { label: 'Last hour', seconds: 3600 },
-  { label: 'Last 6 hours', seconds: 6 * 3600 },
-  { label: 'Last 24 hours', seconds: 24 * 3600 },
-];
-
 /** Wrap every occurrence of `token` in the body in a <mark>. */
 function highlightToken(body: string, token: string): ReactNode {
   if (!token) return body;
@@ -726,263 +834,101 @@ function highlightToken(body: string, token: string): ReactNode {
 /** What one search resolved to — the token snapshot travels WITH the result. */
 interface NeedleSearchResult {
   windows: TokenWindow[];
+  /** Matching windows before any server-side truncation. */
+  total: number;
   scanned: number;
+  /** Windows the needle index removed as PROVABLY token-free. */
+  prunedWindows: number;
+  /** `null` = no needle assist ran; the ranking falls back to the blooms. */
+  stats: NeedleStats | null;
   /** The token this window list was searched with — the drill greps for
    *  exactly this, so editing the input afterwards can't grep a different
    *  token, and a superseded search can't leave its token behind. */
   searchedToken: string;
 }
 
-function NeedleSection(): ReactElement {
-  const [token, setToken] = useState('');
-  const [service, setService] = useState('');
-  const [rangeSecs, setRangeSecs] = useState(3600);
-  /** The row a drill is running against — for the per-row busy state. */
-  const [drillTarget, setDrillTarget] = useState<TokenWindow | null>(null);
+/** Runs rendered per service before the group says "narrow it". */
+const RUNS_PER_GROUP = 25;
 
-  // The hook's generation guard closes the stale-response race this search
-  // used to have: two searches in flight resolved in ARRIVAL order, so a
-  // slower older search overwrote the newer results.
-  const search = useAsyncOp<NeedleSearchResult, [string, string, number]>(
-    async (ctx, tok, svc, secs) => {
-      const now = Date.now() * 1e6;
-      const qs = new URLSearchParams({
-        token: tok,
-        from_ns: String(Math.floor(now - secs * 1e9)),
-        to_ns: String(Math.floor(now)),
-      });
-      if (svc) qs.set('service', svc);
-      const r = await apiFetch(`/v1/search_tokens?${qs}`, undefined, ctx.signal);
-      if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
-      const d = (await r.json()) as { windows: TokenWindow[]; scanned_files: number };
-      return {
-        data: { windows: d.windows, scanned: d.scanned_files, searchedToken: tok },
-        receipt: `${d.windows.length} candidate window${d.windows.length === 1 ? '' : 's'} · ${
-          d.scanned_files
-        } summary files consulted`,
-      };
-    },
-    { label: 'Search', timeoutMs: FETCH_TIMEOUT_MS }
-  );
+/**
+ * Expand everything only while everything still FITS. Past that the top
+ * group is expanded and the rest stand as one-line summaries — which is the
+ * difference between 4,056 rows and a page you can read.
+ */
+function expandsByDefault(groups: NeedleGroup[]): (index: number) => boolean {
+  const totalRuns = groups.reduce((n, g) => n + g.runs.length, 0);
+  const all = groups.length <= 5 && totalRuns <= RUNS_PER_GROUP;
+  return (index: number) => all || index === 0;
+}
 
-  // The drill used to have NO feedback at all for ~10 s of raw-tier grep.
-  const drill = useAsyncOp<RawGrepResponse, [TokenWindow, string]>(
-    async (ctx, w, tok) => {
-      const r = await apiFetch(
-        '/v1/raw_grep',
-        {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            service: w.service,
-            from_ns: w.window_start_ns,
-            to_ns: w.window_end_ns,
-            token: tok,
-            limit: 5,
-          }),
-        },
-        ctx.signal
-      );
-      if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
-      const got = (await r.json()) as RawGrepResponse;
-      return {
-        data: got,
-        receipt: `${got.events.length} verbatim match${got.events.length === 1 ? '' : 'es'} · ${
-          got.files_scanned
-        } raw file${got.files_scanned === 1 ? '' : 's'} scanned`,
-      };
-    },
-    { label: 'Grep', timeoutMs: FETCH_TIMEOUT_MS }
-  );
+function signalChipColor(signal: NeedleSignal): 'success' | 'primary' | 'warning' | 'default' {
+  if (signal === 'corroborated') return 'success';
+  if (signal === 'bloom-hit') return 'primary';
+  if (signal === 'saturated') return 'warning';
+  return 'default';
+}
 
-  const result = search.state.data;
-  const windows = result?.windows ?? null;
-  const scanned = result?.scanned ?? 0;
-  const searchedToken = result?.searchedToken ?? '';
-  const grep = drill.state.data;
-  const drilling = drill.state.phase === 'running';
-
-  const onDrill = (w: TokenWindow): void => {
-    // Re-entry on the SAME row is a no-op; a different row supersedes.
-    if (drilling && drillTarget === w) return;
-    setDrillTarget(w);
-    drill.run(w, searchedToken);
-  };
-
-  const tokenTooShort = token.length < 3;
-  const regionBar = drilling ? drill.state : search.state;
-
+function SignalChip({ signal }: { signal: NeedleSignal }): ReactElement {
   return (
-    <Box sx={card}>
-      <AsyncOpBar state={regionBar} testId="asyncop-bar-needle" />
-      <Typography variant="h6" sx={{ fontWeight: 600 }}>
-        Needle search
-      </Typography>
-      <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-        Grep months of raw logs for one token (a request id, an IP, an error string). Token blooms prune to the
-        candidate windows; the drill-down greps the window and shows only verbatim matches — a bloom false positive says
-        so instead of showing an unrelated event.
-      </Typography>
-      <Stack direction="row" gap={1.5} alignItems="center" flexWrap="wrap">
-        <TextField
-          size="small"
-          label="Token (≥ 3 chars)"
-          value={token}
-          onChange={(e) => setToken(e.target.value)}
-          sx={{ minWidth: 260 }}
-          slotProps={{ input: { sx: mono } }}
-        />
-        <TextField
-          size="small"
-          label="Service (optional)"
-          value={service}
-          onChange={(e) => setService(e.target.value)}
-          sx={{ minWidth: 180 }}
-          slotProps={{ input: { sx: mono } }}
-        />
-        <TextField
-          size="small"
-          select
-          label="Range"
-          value={rangeSecs}
-          onChange={(e) => setRangeSecs(Number(e.target.value))}
-          sx={{ minWidth: 160 }}
-        >
-          {RANGES.map((r) => (
-            <MenuItem key={r.seconds} value={r.seconds}>
-              {r.label}
-            </MenuItem>
-          ))}
-        </TextField>
-        {/* Blocked only by a PRECONDITION, never by in-flight work — and the
-            reason is rendered next to it instead of left mute. */}
-        <Button
-          variant="contained"
-          onClick={() => search.run(token, service, rangeSecs)}
-          disabled={tokenTooShort}
-          {...asyncOpTriggerProps(search.state)}
-        >
-          {search.state.phase === 'running' ? 'Searching…' : 'Search'}
-        </Button>
-        {tokenTooShort && (
-          <Typography variant="caption" color="text.secondary">
-            enter at least 3 characters to search
-          </Typography>
-        )}
-      </Stack>
-      <Stack direction="row" gap={2.5} alignItems="center" flexWrap="wrap">
-        <AsyncOpStatus
-          id="needle-search"
-          state={search.state}
-          label="Search"
-          runningHint="Probing token blooms across the summary tier…"
-          onCancel={search.cancel}
-        />
-        <AsyncOpStatus
-          id="needle-drill"
-          state={drill.state}
-          label="Grep"
-          runningHint={
-            drillTarget
-              ? `Greping 1 window · ${drillTarget.event_count.toLocaleString()} events…`
-              : 'Greping the window…'
-          }
-          onCancel={drill.cancel}
-        />
-      </Stack>
+    <Tooltip title={SIGNAL_EXPLAIN[signal]}>
+      <Chip
+        size="small"
+        variant="outlined"
+        color={signalChipColor(signal)}
+        label={SIGNAL_LABEL[signal]}
+        data-testid="needle-signal-chip"
+      />
+    </Tooltip>
+  );
+}
 
-      {search.state.error !== null && (
-        <Alert severity="error" sx={{ mt: 1.5, ...mono, fontSize: 12 }}>
-          {search.state.error}
-        </Alert>
-      )}
+/** `10:00:00 → 14:00:00` when the run stays inside one day; full stamps otherwise. */
+function runSpan(run: NeedleRun): string {
+  const from = tsPretty(run.startNs);
+  const to = tsPretty(run.endNs);
+  return from.slice(0, 10) === to.slice(0, 10) ? `${from} → ${to.slice(11)}` : `${from} → ${to}`;
+}
 
-      {windows && (
-        <Box sx={{ mt: 2, opacity: search.state.phase === 'running' ? 0.45 : 1 }}>
-          <Typography variant="body2" color="text.secondary">
-            {windows.length} candidate window{windows.length === 1 ? '' : 's'} · {scanned} summary files consulted
-            {windows.length > 0 ? ' — click a window to grep it for verbatim matches' : ''}
-          </Typography>
-          {windows.length > 0 && (
-            <table style={{ borderCollapse: 'collapse', width: '100%', marginTop: 8 }}>
-              <tbody>
-                {windows.slice(0, 50).map((w, i) => (
-                  <Fragment key={i}>
-                    <tr
-                      onClick={() => onDrill(w)}
-                      aria-busy={drilling && drillTarget === w}
-                      data-testid="needle-window-row"
-                      style={{
-                        borderTop: '1px solid rgba(128,128,128,0.15)',
-                        cursor: 'pointer',
-                      }}
-                      title="Grep this window for verbatim matches"
-                    >
-                      <td style={{ padding: '5px 12px 5px 0' }}>
-                        <Typography variant="body2" sx={mono}>
-                          {w.service}
-                        </Typography>
-                      </td>
-                      <td style={{ padding: '5px 12px 5px 0' }}>
-                        <Typography variant="body2" sx={{ ...mono, fontSize: 12 }}>
-                          {tsPretty(w.window_start_ns)} → {tsPretty(w.window_end_ns).slice(11)}
-                        </Typography>
-                      </td>
-                      <td style={{ padding: '5px 12px 5px 0' }}>
-                        <Typography variant="caption" color="text.secondary">
-                          {w.event_count.toLocaleString()} events
-                        </Typography>
-                      </td>
-                      <td style={{ padding: '5px 0' }}>
-                        {w.saturated ? (
-                          <Chip size="small" variant="outlined" color="warning" label="bloom saturated" />
-                        ) : w.bloom_match ? (
-                          <Chip size="small" variant="outlined" color="success" label="bloom hit" />
-                        ) : (
-                          <Chip size="small" variant="outlined" label="no bloom (maybe)" />
-                        )}
-                      </td>
-                    </tr>
-                    {/* Row-scoped activity. The region bar runs too — a
-                      drilling row can be scrolled out of view. */}
-                    {drillTarget === w && (
-                      <tr>
-                        <td colSpan={4} style={{ padding: 0 }}>
-                          <AsyncOpBar state={drill.state} />
-                        </td>
-                      </tr>
-                    )}
-                  </Fragment>
-                ))}
-              </tbody>
-            </table>
-          )}
-        </Box>
-      )}
-
-      {drill.state.error !== null && (
-        <Alert severity="error" sx={{ mt: 1.5, ...mono, fontSize: 12 }}>
-          {drill.state.error}
+/**
+ * The verbatim answer, rendered INLINE under the row that asked for it (U9).
+ * It used to render after the whole candidate list, so clicking row 11 of 50
+ * put the answer below row 50 — off-screen, found only by pressing End.
+ */
+function DrillResult({
+  state,
+  grep,
+  token,
+}: {
+  state: ReturnType<typeof useAsyncOp<RawGrepResponse, [NeedleRun, string]>>['state'];
+  grep: RawGrepResponse | null;
+  token: string;
+}): ReactElement {
+  return (
+    <Box sx={{ pl: 2, pb: 1.5, borderLeft: '2px solid', borderColor: 'primary.main' }} data-testid="needle-drill-panel">
+      <AsyncOpBar state={state} />
+      {state.error !== null && (
+        <Alert severity="error" sx={{ mt: 1, ...mono, fontSize: 12 }}>
+          {state.error}
         </Alert>
       )}
       {grep && (grep.owners_failed ?? 0) > 0 && (
-        <Alert severity="warning" sx={{ mt: 1.5 }}>
+        <Alert severity="warning" sx={{ mt: 1 }}>
           {grep.owners_failed} owner node{grep.owners_failed === 1 ? '' : 's'} failed to answer — coverage is partial;
           matches below may be incomplete.
         </Alert>
       )}
       {grep && grep.events.length === 0 && grep.files_scanned === 0 && (
-        <Alert severity="info" sx={{ mt: 1.5 }}>
+        <Alert severity="info" sx={{ mt: 1 }}>
           No raw files cover this window yet (still inside the flush window?).
         </Alert>
       )}
       {grep && grep.events.length === 0 && grep.files_scanned > 0 && (
-        <Alert severity="info" sx={{ mt: 1.5 }} data-testid="needle-honest-miss">
-          No verbatim match for &quot;{searchedToken}&quot; in this window — the bloom candidate was a false positive.
+        <Alert severity="info" sx={{ mt: 1 }} data-testid="needle-honest-miss">
+          No verbatim match for &quot;{token}&quot; in this window — the bloom candidate was a false positive.
         </Alert>
       )}
       {grep && grep.events.length > 0 && (
-        <Box sx={{ mt: 1.5 }}>
+        <Box sx={{ mt: 1 }}>
           <Typography variant="body2" color="text.secondary">
             {grep.events.length} verbatim match{grep.events.length === 1 ? '' : 'es'}
             {grep.truncated ? ` — more exist, showing the first ${grep.events.length}` : ''} · {grep.files_scanned} raw
@@ -1005,11 +951,398 @@ function NeedleSection(): ReactElement {
               </Typography>
               <Typography component="pre" sx={{ ...mono, fontSize: 12, whiteSpace: 'pre-wrap', m: 0 }}>
                 {ev.body_utf8 !== undefined
-                  ? highlightToken(ev.body_utf8, searchedToken)
+                  ? highlightToken(ev.body_utf8, token)
                   : `(binary body, base64) ${ev.body_base64 ?? ''}`}
               </Typography>
             </Box>
           ))}
+        </Box>
+      )}
+    </Box>
+  );
+}
+
+/**
+ * Everything the needle index will admit about its own probe. It is the
+ * reason the ranking can claim anything at all, so when it did not run — or
+ * ran degraded — the list says so instead of quietly ranking on nothing.
+ */
+function NeedleProbeNotes({ result }: { result: NeedleSearchResult }): ReactElement | null {
+  const notes: string[] = [];
+  if (result.prunedWindows > 0) {
+    notes.push(
+      `${result.prunedWindows.toLocaleString()} window${
+        result.prunedWindows === 1 ? '' : 's'
+      } removed by the needle index as provably token-free — they are not hidden, they are excluded.`
+    );
+  }
+  if (result.stats === null) {
+    notes.push(
+      'No needle-index assist ran for this search (no raw tier/catalog, or the token is below the indexing floor), so ranking rests on the token blooms alone.'
+    );
+  } else {
+    if (result.stats.listing_failed) {
+      notes.push(
+        'A store listing failed, so part of the range degraded to "not covered" — over-keep, never a false negative.'
+      );
+    }
+    if (result.stats.manifest_budget_exhausted === true) {
+      notes.push(
+        'The manifest probe hit its byte budget; the files it could not read are kept as whole-file candidates. Build the day slabs to lift this.'
+      );
+    }
+    if (result.stats.unindexed_files > 0) {
+      notes.push(
+        `${result.stats.unindexed_files.toLocaleString()} raw file${
+          result.stats.unindexed_files === 1 ? '' : 's'
+        } in range are not signature-covered (fresh or never compacted) — the index cannot corroborate those windows either way.`
+      );
+    }
+  }
+  if (notes.length === 0) return null;
+  return (
+    <Box sx={{ mt: 1 }} data-testid="needle-probe-notes">
+      {notes.map((n, i) => (
+        <Typography key={i} variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+          {n}
+        </Typography>
+      ))}
+    </Box>
+  );
+}
+
+function NeedleSection(): ReactElement {
+  const [token, setToken] = useState('');
+  const [service, setService] = useState('');
+  // U11: no private Range dropdown here any more — the needle searches the
+  // SAME window the SQL box, the dashboards and Investigate are looking at.
+  const { range } = useSharedTimeRange();
+  /** The run a drill is running against — for the per-row busy state. */
+  const [drillTarget, setDrillTarget] = useState<NeedleRun | null>(null);
+  /** Per-service expand overrides; `undefined` = whatever the default says. */
+  const [expandOverride, setExpandOverride] = useState<Record<string, boolean>>({});
+
+  // The hook's generation guard closes the stale-response race this search
+  // used to have: two searches in flight resolved in ARRIVAL order, so a
+  // slower older search overwrote the newer results.
+  const search = useAsyncOp<NeedleSearchResult, [string, string, number, number]>(
+    async (ctx, tok, svc, fromNs, toNs) => {
+      const qs = new URLSearchParams({
+        token: tok,
+        from_ns: String(fromNs),
+        to_ns: String(toNs),
+      });
+      if (svc) qs.set('service', svc);
+      const r = await apiFetch(`/v1/search_tokens?${qs}`, undefined, ctx.signal);
+      if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+      const d = (await r.json()) as {
+        windows?: TokenWindow[];
+        total?: number;
+        scanned_files?: number;
+        needle_pruned_windows?: number;
+        needle?: NeedleStats | null;
+      };
+      if (!Array.isArray(d.windows)) {
+        // Loud schema drift, same rule as the SQL envelope: an empty list is
+        // a real and meaningful answer ("the blooms pruned everything"), so
+        // a missing list must never be able to impersonate one.
+        throw new Error('GET /v1/search_tokens did not return a `windows` array — this node is not one this UI knows.');
+      }
+      const windows = d.windows;
+      return {
+        data: {
+          windows,
+          total: typeof d.total === 'number' ? d.total : windows.length,
+          scanned: d.scanned_files ?? 0,
+          prunedWindows: d.needle_pruned_windows ?? 0,
+          stats: d.needle ?? null,
+          searchedToken: tok,
+        },
+        receipt: `${windows.length} candidate window${windows.length === 1 ? '' : 's'} · ${
+          d.scanned_files ?? 0
+        } summary files consulted`,
+      };
+    },
+    { label: 'Search', timeoutMs: FETCH_TIMEOUT_MS }
+  );
+
+  // The drill used to have NO feedback at all for ~10 s of raw-tier grep.
+  // It now greps a whole COLLAPSED RUN in one request: a run is contiguous
+  // and single-service by construction, so [start, end) is one window as far
+  // as /v1/raw_grep is concerned — 48 rows became one row and 48 potential
+  // requests became one.
+  const drill = useAsyncOp<RawGrepResponse, [NeedleRun, string]>(
+    async (ctx, run, tok) => {
+      const r = await apiFetch(
+        '/v1/raw_grep',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            service: run.service,
+            from_ns: run.startNs,
+            to_ns: run.endNs,
+            token: tok,
+            limit: 5,
+          }),
+        },
+        ctx.signal
+      );
+      if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
+      const got = (await r.json()) as RawGrepResponse;
+      return {
+        data: got,
+        receipt: `${got.events.length} verbatim match${got.events.length === 1 ? '' : 'es'} · ${
+          got.files_scanned
+        } raw file${got.files_scanned === 1 ? '' : 's'} scanned`,
+      };
+    },
+    { label: 'Grep', timeoutMs: FETCH_TIMEOUT_MS }
+  );
+
+  const result = search.state.data;
+  const windows = result?.windows ?? null;
+  const searchedToken = result?.searchedToken ?? '';
+  const grep = drill.state.data;
+  const drilling = drill.state.phase === 'running';
+
+  // Ranked, collapsed and grouped ONCE per result — the runs must keep their
+  // identity across renders or `drillTarget === run` (the per-row busy state
+  // and the inline result) would break on every keystroke.
+  const groups = useMemo(() => groupNeedleWindows(windows ?? []), [windows]);
+  const tally = useMemo(() => signalTally(windows ?? []), [windows]);
+  const isDefaultExpanded = useMemo(() => expandsByDefault(groups), [groups]);
+  const guidance = useMemo(() => startHere(groups), [groups]);
+
+  // A new result set is a new page: previous expand choices described a
+  // different list and must not survive into this one.
+  useEffect(() => {
+    setExpandOverride({});
+    setDrillTarget(null);
+  }, [result]);
+
+  const onDrill = (run: NeedleRun): void => {
+    // Re-entry on the SAME row is a no-op; a different row supersedes.
+    if (drilling && drillTarget === run) return;
+    setDrillTarget(run);
+    drill.run(run, searchedToken);
+  };
+
+  const runSearch = (): void => {
+    const r = resolveRange(range, Date.now());
+    search.run(token, service, r.fromNs, r.toNs);
+  };
+
+  const tokenTooShort = token.length < 3;
+  const regionBar = drilling ? drill.state : search.state;
+
+  return (
+    <Box sx={card}>
+      <AsyncOpBar state={regionBar} testId="asyncop-bar-needle" />
+      <Typography variant="h6" sx={{ fontWeight: 600 }}>
+        Needle search
+      </Typography>
+      <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
+        Grep months of raw logs for one token (a request id, an IP, an error string). Token blooms prune to the
+        candidate windows and the bit-sliced needle index corroborates them; the drill-down greps the window and shows
+        only verbatim matches — a bloom false positive says so instead of showing an unrelated event.
+      </Typography>
+      <Stack direction="row" gap={1.5} alignItems="center" flexWrap="wrap">
+        <TextField
+          size="small"
+          label="Token (≥ 3 chars)"
+          value={token}
+          onChange={(e) => setToken(e.target.value)}
+          sx={{ minWidth: 260 }}
+          slotProps={{ input: { sx: mono } }}
+        />
+        <TextField
+          size="small"
+          label="Service (optional)"
+          value={service}
+          onChange={(e) => setService(e.target.value)}
+          sx={{ minWidth: 180 }}
+          slotProps={{ input: { sx: mono } }}
+        />
+        {/* Blocked only by a PRECONDITION, never by in-flight work — and the
+            reason is rendered next to it instead of left mute. */}
+        <Button variant="contained" onClick={runSearch} disabled={tokenTooShort} {...asyncOpTriggerProps(search.state)}>
+          {search.state.phase === 'running' ? 'Searching…' : 'Search'}
+        </Button>
+        {tokenTooShort && (
+          <Typography variant="caption" color="text.secondary">
+            enter at least 3 characters to search
+          </Typography>
+        )}
+        <Typography variant="caption" color="text.secondary">
+          searching {rangeLabel(range)} — set above
+        </Typography>
+      </Stack>
+      <Stack direction="row" gap={2.5} alignItems="center" flexWrap="wrap">
+        <AsyncOpStatus
+          id="needle-search"
+          state={search.state}
+          label="Search"
+          runningHint="Probing token blooms across the summary tier…"
+          onCancel={search.cancel}
+        />
+        <AsyncOpStatus
+          id="needle-drill"
+          state={drill.state}
+          label="Grep"
+          runningHint={
+            drillTarget
+              ? `Greping ${drillTarget.windows.toLocaleString()} window${
+                  drillTarget.windows === 1 ? '' : 's'
+                } · ${drillTarget.eventCount.toLocaleString()} events…`
+              : 'Greping the window…'
+          }
+          onCancel={drill.cancel}
+        />
+      </Stack>
+
+      {search.state.error !== null && (
+        <Alert severity="error" sx={{ mt: 1.5, ...mono, fontSize: 12 }}>
+          {search.state.error}
+        </Alert>
+      )}
+
+      {result && (
+        <Box sx={{ mt: 2, opacity: search.state.phase === 'running' ? 0.45 : 1 }}>
+          {/* The headline: what the search found, said in the units that
+              actually differ between rows. The old line said "N candidate
+              windows" and nothing else, which is why 4,056 identical rows
+              read as failure rather than as one saturated bloom. */}
+          <Typography variant="body2" color="text.secondary" data-testid="needle-summary">
+            {result.total.toLocaleString()} candidate window{result.total === 1 ? '' : 's'} across{' '}
+            {groups.length.toLocaleString()} service{groups.length === 1 ? '' : 's'} · {result.scanned.toLocaleString()}{' '}
+            summary files consulted
+          </Typography>
+          <Stack direction="row" gap={1} flexWrap="wrap" sx={{ mt: 0.75 }}>
+            {(['corroborated', 'bloom-hit', 'no-bloom', 'saturated'] as NeedleSignal[])
+              .filter((s) => tally[s] > 0)
+              .map((s) => (
+                <Tooltip key={s} title={SIGNAL_EXPLAIN[s]}>
+                  <Chip
+                    size="small"
+                    variant="outlined"
+                    color={signalChipColor(s)}
+                    label={`${tally[s].toLocaleString()} ${SIGNAL_LABEL[s]}`}
+                  />
+                </Tooltip>
+              ))}
+          </Stack>
+          {guidance !== null && (
+            <Alert severity="info" sx={{ mt: 1.5 }} data-testid="needle-start-here">
+              {guidance}
+            </Alert>
+          )}
+          <NeedleProbeNotes result={result} />
+
+          {groups.length === 0 ? (
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 1.5 }}>
+              No window survived the blooms in this range — for a window that carries a bloom, that is a definite
+              &quot;not here&quot;, not a maybe.
+            </Typography>
+          ) : (
+            <Box sx={{ mt: 1.5 }}>
+              {groups.map((group, gi) => {
+                const open = expandOverride[group.service] ?? isDefaultExpanded(gi);
+                return (
+                  <Box
+                    key={group.service}
+                    sx={{ borderTop: '1px solid rgba(128,128,128,0.15)' }}
+                    data-testid="needle-group"
+                  >
+                    <Stack
+                      direction="row"
+                      gap={1}
+                      alignItems="center"
+                      flexWrap="wrap"
+                      sx={{ py: 0.75, cursor: 'pointer' }}
+                      onClick={() => setExpandOverride((prev) => ({ ...prev, [group.service]: !open }))}
+                      role="button"
+                      aria-expanded={open}
+                      data-testid="needle-group-header"
+                    >
+                      {open ? <ChevronDown fontSize="small" /> : <ChevronRight fontSize="small" />}
+                      <Typography variant="body2" sx={{ ...mono, fontWeight: 600 }}>
+                        {group.service}
+                      </Typography>
+                      <SignalChip signal={group.best} />
+                      <Typography variant="caption" color="text.secondary">
+                        {group.runs.length.toLocaleString()} run{group.runs.length === 1 ? '' : 's'} ·{' '}
+                        {group.windowCount.toLocaleString()} window{group.windowCount === 1 ? '' : 's'} ·{' '}
+                        {group.eventCount.toLocaleString()} events
+                      </Typography>
+                      {/* The move the operator made by hand on the live
+                          drive — typing a service name cut 4,056 rows to 50
+                          — is one click here. */}
+                      <Chip
+                        size="small"
+                        variant="outlined"
+                        label="only this service"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setService(group.service);
+                        }}
+                      />
+                    </Stack>
+                    {open && (
+                      <table style={{ borderCollapse: 'collapse', width: '100%' }}>
+                        <tbody>
+                          {group.runs.slice(0, RUNS_PER_GROUP).map((run, i) => (
+                            <Fragment key={`${run.startNs}:${i}`}>
+                              <tr
+                                onClick={() => onDrill(run)}
+                                aria-busy={drilling && drillTarget === run}
+                                data-testid="needle-window-row"
+                                style={{
+                                  borderTop: '1px solid rgba(128,128,128,0.08)',
+                                  cursor: 'pointer',
+                                }}
+                                title="Grep this window for verbatim matches"
+                              >
+                                <td style={{ padding: '5px 12px 5px 24px' }}>
+                                  <Typography variant="body2" sx={{ ...mono, fontSize: 12 }}>
+                                    {runSpan(run)}
+                                  </Typography>
+                                </td>
+                                <td style={{ padding: '5px 12px 5px 0' }}>
+                                  <Typography variant="caption" color="text.secondary">
+                                    {run.windows > 1 ? `${run.windows.toLocaleString()} contiguous windows · ` : ''}
+                                    {run.eventCount.toLocaleString()} events
+                                  </Typography>
+                                </td>
+                                <td style={{ padding: '5px 0' }}>
+                                  <SignalChip signal={run.signal} />
+                                </td>
+                              </tr>
+                              {/* U9: the answer belongs under the row that
+                                  asked the question, not after the list. */}
+                              {drillTarget === run && (
+                                <tr>
+                                  <td colSpan={3} style={{ padding: 0 }}>
+                                    <DrillResult state={drill.state} grep={grep ?? null} token={searchedToken} />
+                                  </td>
+                                </tr>
+                              )}
+                            </Fragment>
+                          ))}
+                        </tbody>
+                      </table>
+                    )}
+                    {open && group.runs.length > RUNS_PER_GROUP && (
+                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', pl: 3, pb: 1 }}>
+                        showing the {RUNS_PER_GROUP} strongest of {group.runs.length.toLocaleString()} runs — narrow the
+                        time range to see the rest
+                      </Typography>
+                    )}
+                  </Box>
+                );
+              })}
+            </Box>
+          )}
         </Box>
       )}
     </Box>
@@ -1022,9 +1355,18 @@ export default function ObsescExploreView(): ReactElement {
       <Typography variant="h4" sx={{ fontWeight: 700, letterSpacing: '-0.01em' }}>
         Explore
       </Typography>
-      <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, mb: 2.5 }}>
+      <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, mb: 2 }}>
         The raw tier keeps 100% of every event as open Parquet. The summary index accelerates — it never gatekeeps.
       </Typography>
+      {/* U11: ONE range for this page — it writes the SQL bounds below AND
+          the needle search window, and it is the same range the dashboards
+          and Investigate run on. */}
+      <Box sx={{ ...card, mb: 2.5, padding: 2 }}>
+        <TimeRangeControl
+          label="Time range"
+          hint="Shared with the dashboards, the needle search and Investigate — set it once."
+        />
+      </Box>
       <Stack gap={2.5}>
         <SqlSection />
         <NeedleSection />
