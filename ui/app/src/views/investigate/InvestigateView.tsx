@@ -333,8 +333,18 @@ function InvestigateView(): ReactElement {
           />
         </Stack>
         <Stack direction="row" gap={1.5} alignItems="center" flexWrap="wrap" sx={{ mt: 2 }}>
-          {/* Precondition-only disable: a re-click supersedes the running diff. */}
-          <Button variant="contained" onClick={run} disabled={invalid} {...asyncOpTriggerProps(diff.state)}>
+          {/* Precondition-only disable: a re-click supersedes the running diff.
+              data-testid, NOT aria-label: the label deliberately flips with the
+              phase and a screen reader should announce that, so the accessible
+              name must stay the live text. An exact-name locator goes stale the
+              instant it flips, which presents as "the control vanished". */}
+          <Button
+            variant="contained"
+            data-testid="investigate-diff-btn"
+            onClick={run}
+            disabled={invalid}
+            {...asyncOpTriggerProps(diff.state)}
+          >
             {running ? 'Running diff…' : 'Run diff'}
           </Button>
           {baselineEdit === null ? (

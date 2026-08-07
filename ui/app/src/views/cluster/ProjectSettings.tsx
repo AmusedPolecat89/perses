@@ -201,6 +201,9 @@ export function ProjectSettings(): ReactElement {
           <Stack direction="row" gap={1} alignItems="center">
             <Button
               variant="contained"
+              // The label flips to Saving… mid-mutation, so a name locator goes
+              // stale exactly when a test wants to watch it.
+              data-testid="project-settings-save-btn"
               disabled={!dirty || mutation.isLoading}
               onClick={() => mutation.mutate()}
             >

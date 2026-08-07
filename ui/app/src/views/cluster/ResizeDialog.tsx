@@ -377,7 +377,7 @@ export function ResizeDialog({
         )}
       </DialogContent>
       <DialogActions>
-        <Button onClick={close} color="inherit">
+        <Button onClick={close} color="inherit" data-testid="resize-dismiss-btn">
           {removed ? 'Close' : 'Cancel'}
         </Button>
       </DialogActions>

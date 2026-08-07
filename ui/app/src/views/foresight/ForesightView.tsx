@@ -518,8 +518,11 @@ export default function ForesightView(): ReactElement {
             <Box sx={{ mt: 1.5 }}>
               <AsyncOpBar state={forecast.state} testId="asyncop-bar-forecast" />
               <Stack direction="row" gap={1.5} alignItems="center" flexWrap="wrap">
+                {/* data-testid because the label flips with the phase — the
+                    accessible name stays the live text on purpose. */}
                 <Button
                   variant="contained"
+                  data-testid="foresight-forecast-btn"
                   onClick={() => forecast.run(service, rangeSecs)}
                   disabled={service.trim().length === 0}
                   {...asyncOpTriggerProps(forecast.state)}
@@ -566,6 +569,7 @@ export default function ForesightView(): ReactElement {
                 </Box>
                 <Button
                   variant="contained"
+                  data-testid="foresight-whatif-btn"
                   onClick={() => whatif.run(service, rangeSecs, steps)}
                   disabled={service.trim().length === 0}
                   {...asyncOpTriggerProps(whatif.state)}

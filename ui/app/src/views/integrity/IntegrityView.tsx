@@ -502,9 +502,11 @@ function VerifySection(): ReactElement {
           slotProps={{ htmlInput: { min: 1, max: MAX_FILES_CAP } }}
         />
         {/* Blocked only by preconditions — never by its own in-flight work.
-            Re-clicking supersedes the running walk. */}
+            Re-clicking supersedes the running walk. data-testid because the
+            label flips to Verifying… and the accessible name must follow it. */}
         <Button
           variant="contained"
+          data-testid="integrity-verify-btn"
           onClick={() => verify.run(chainId, fromLocal, maxFilesNum)}
           disabled={chainId.trim().length === 0 || !maxFilesValid}
           {...asyncOpTriggerProps(verify.state)}

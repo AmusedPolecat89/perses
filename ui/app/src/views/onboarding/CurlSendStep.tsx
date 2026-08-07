@@ -105,8 +105,11 @@ export function CurlSendStep(): ReactElement {
           <Typography variant="overline" color="text.secondary">
             Copy &amp; run on any shell
           </Typography>
+          {/* data-testid: the label flips to Copied on click, so a name
+              locator only works for the first second after page load. */}
           <Button
             size="small"
+            data-testid="curl-copy-btn"
             startIcon={copied ? <CheckCircle /> : <ContentCopy />}
             onClick={copy}
           >
