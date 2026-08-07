@@ -31,6 +31,7 @@ import { buildGlobalVariableDefinition, buildProjectVariableDefinition } from '.
 import { useIsLocalDatasourceEnabled, useIsLocalVariableEnabled } from '../../../context/Config';
 import { useRemotePluginLoader } from '../../../model/remote-plugin-loader';
 import { PERSES_APP_CONFIG } from '../../../config';
+import { useSeedDashboardTimeParams } from '../../../hooks/use-time-range-url';
 
 export interface GenericDashboardViewProps {
   dashboardResource: DashboardResource | EphemeralDashboardResource;
@@ -62,6 +63,14 @@ export function HelperDashboardView(props: GenericDashboardViewProps): ReactElem
   const datasourceApi = useDatasourceApi();
   const pluginLoader = useRemotePluginLoader();
 
+  // OBSESC U11: a range chosen on Explore / Investigate has to be in the URL
+  // BEFORE ViewDashboard renders — `useInitialTimeRange` reads the params
+  // during that first render, and Perses' own writer fills a missing `start`
+  // with this dashboard's authored duration. Withholding the dashboard for
+  // the tick it takes to write the params is the only ordering that does not
+  // race. Cold sessions seed nothing, so an authored duration still stands.
+  const timeParamsReady = useSeedDashboardTimeParams();
+
   // Collect the Project variables and setup external variables from it
   const { data: project, isLoading: isLoadingProject } = useProject(dashboardResource.metadata.project);
   const { data: globalVars, isLoading: isLoadingGlobalVars } = useGlobalVariableList();
@@ -74,7 +83,7 @@ export function HelperDashboardView(props: GenericDashboardViewProps): ReactElem
     [dashboardResource, projectVars, globalVars]
   );
 
-  if (isLoadingProject || isLoadingProjectVars || isLoadingGlobalVars) {
+  if (!timeParamsReady || isLoadingProject || isLoadingProjectVars || isLoadingGlobalVars) {
     return (
       <Stack width="100%" sx={{ alignItems: 'center', justifyContent: 'center' }}>
         <CircularProgress />

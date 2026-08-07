@@ -20,6 +20,7 @@ import Footer from './components/Footer';
 import { OnboardingBanner } from './components/OnboardingBanner';
 import { DelegatedAuthnErrorRoute, SignInRoute, SignUpRoute } from './model/route';
 import { PersesLoader } from './components/PersesLoader';
+import { useTimeRangeUrlMirror } from './hooks/use-time-range-url';
 import './i18n/i18n';
 
 function isDashboardViewRoute(pathname: string): boolean {
@@ -28,6 +29,11 @@ function isDashboardViewRoute(pathname: string): boolean {
 
 function App(): ReactElement {
   const location = useLocation();
+  // OBSESC U11: one time range across dashboards, Explore and Investigate.
+  // The Perses `start`/`end` query params are the shared encoding; this
+  // mirrors them into (and out of) the app-level store the custom views
+  // read, so a window set on a dashboard survives the jump to Explore.
+  useTimeRangeUrlMirror();
 
   return (
     <Box

@@ -17,11 +17,14 @@
 // the plugin renderer — keep in sync with DiffReportView
 // (ui/plugins/datasource-obsesc/src/plugins/investigate/DiffReportView.tsx).
 
-import { ReactElement, useRef, useState } from 'react';
+import { ReactElement, useMemo, useState } from 'react';
 import { Alert, Box, Button, Chip, Stack, TextField, Tooltip, Typography } from '@mui/material';
 import { AsyncOpBar, AsyncOpStatus, asyncOpTriggerProps } from '../../components/progress/AsyncOp';
 import { useAsyncOp } from '../../components/progress/useAsyncOp';
 import { eitherSignal } from '../../utils/either-signal';
+import { TimeRangeControl } from '../../components/TimeRangeControl';
+import { useSharedTimeRange } from '../../hooks/use-shared-time-range';
+import { localInputToMs, msToLocalInput, rangeKey, resolveRange } from '../../model/time-range';
 
 const API = '/obsesc-api';
 // Cross-node diffs gather from every shard owner — allow the long tail.
@@ -115,32 +118,71 @@ interface DiffReport {
 
 // ─── helpers ────────────────────────────────────────────────────────────
 
-function nsToLocalInput(ns: number): string {
-  const d = new Date(Math.floor(ns / NS_PER_MS));
-  const p = (n: number): string => String(n).padStart(2, '0');
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(
-    d.getMinutes()
-  )}:${p(d.getSeconds())}`;
-}
-
 function localInputToNs(v: string): number | null {
-  const ms = new Date(v).getTime();
-  return Number.isFinite(ms) ? ms * NS_PER_MS : null;
+  const ms = localInputToMs(v);
+  return ms === null ? null : ms * NS_PER_MS;
 }
 
+/** Decimals track magnitude: never more precision than the number means. */
+function percentDecimals(abs: number): number {
+  if (abs >= 10) return 1;
+  if (abs >= 1) return 2;
+  if (abs >= 0.01) return 3;
+  return 4;
+}
+
+/**
+ * U13. Every `*_rate` on this report is a per-event fraction (count ÷ window
+ * events), so the interesting ones live around 1e−4 and used to render as
+ * `-4.12e-4` beside `+3.38e-4` — correct, and impossible to rank by eye.
+ *
+ * Percent-of-events is ONE unit across the whole range: a template that is
+ * 40 % of the traffic and one that is 0.0338 % of it are still comparable at
+ * a glance, which two exponents never are. Anything smaller than the last
+ * displayed digit says so ("<0.0001%") rather than rounding itself away to a
+ * flat 0 — a rate that is tiny and a rate that is absent are different facts.
+ */
 function fmtRate(r: number): string {
-  if (r === 0) return '0';
-  if (Math.abs(r) < 0.001) return r.toExponential(2);
-  return r.toFixed(4);
+  if (!Number.isFinite(r)) return '—';
+  if (r === 0) return '0%';
+  const pct = r * 100;
+  const abs = Math.abs(pct);
+  if (abs < 0.0001) return `${pct < 0 ? '-' : ''}<0.0001%`;
+  return `${pct.toFixed(percentDecimals(abs))}%`;
 }
 
 function fmtDelta(r: number): string {
-  const s = fmtRate(Math.abs(r));
-  return r >= 0 ? `+${s}` : `-${s}`;
+  if (!Number.isFinite(r)) return '—';
+  if (r === 0) return '0%';
+  return r > 0 ? `+${fmtRate(r)}` : `-${fmtRate(Math.abs(r))}`;
+}
+
+function absoluteDecimals(abs: number): number {
+  if (abs >= 100) return 0;
+  if (abs >= 1) return 1;
+  return 3;
+}
+
+/**
+ * Quantile shifts are NOT rates — they are absolute movements in the
+ * attribute's own units, sitting next to `baseline.toFixed(1) →
+ * incident.toFixed(1)`. Running them through the percent formatter would
+ * relabel milliseconds as a percentage, which is a worse defect than the one
+ * U13 reports.
+ */
+function fmtNumDelta(v: number): string {
+  if (!Number.isFinite(v)) return '—';
+  const abs = Math.abs(v);
+  return `${v >= 0 ? '+' : '-'}${abs.toFixed(absoluteDecimals(abs))}`;
 }
 
 function tsPretty(ns: number): string {
   return new Date(ns / 1e6).toISOString().replace('T', ' ').slice(0, 19);
+}
+
+/** Largest |Δ| in a section — the scale every bar in that section shares. */
+function maxAbs(values: number[]): number {
+  return values.reduce((m, v) => (Number.isFinite(v) && Math.abs(v) > m ? Math.abs(v) : m), 0);
 }
 
 function templateLabel(d: TemplateDelta): string {
@@ -168,38 +210,60 @@ const MATCH_EXPLAIN: Record<'Id' | 'Pattern', { label: string; explain: string }
 // ─── the view ───────────────────────────────────────────────────────────
 
 function InvestigateView(): ReactElement {
-  const nowNs = useRef(Date.now() * NS_PER_MS).current;
-
   const [service, setService] = useState('svc-000');
-  const [incidentFrom, setIncidentFrom] = useState(nsToLocalInput(nowNs - HOUR_MS * NS_PER_MS));
-  const [incidentTo, setIncidentTo] = useState(nsToLocalInput(nowNs));
-  const [baselineFrom, setBaselineFrom] = useState(nsToLocalInput(nowNs - (HOUR_MS + DAY_MS) * NS_PER_MS));
-  const [baselineTo, setBaselineTo] = useState(nsToLocalInput(nowNs - DAY_MS * NS_PER_MS));
 
-  const bounds = {
-    baseline_from_ns: localInputToNs(baselineFrom),
-    baseline_to_ns: localInputToNs(baselineTo),
-    incident_from_ns: localInputToNs(incidentFrom),
-    incident_to_ns: localInputToNs(incidentTo),
+  // U11: the INCIDENT window is the shared range — the same one the
+  // dashboards and Explore use — so an investigation that starts on a
+  // dashboard arrives here already pointed at the right window. The BASELINE
+  // stays local by definition: it is a second, deliberately different window.
+  const { range } = useSharedTimeRange();
+  // Pin the clock per range identity, so a RELATIVE range does not re-derive
+  // the baseline fields on every render (a datetime-local that ticks once a
+  // second cannot be typed into). The submitted window is resolved again at
+  // click time; see `run`.
+  const rangeK = rangeKey(range);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  const previewIncident = useMemo(() => resolveRange(range, Date.now()), [rangeK]);
+
+  // `null` = "still incident −24h", and it FOLLOWS the incident window when
+  // that moves. Only an explicit edit pins the baseline in place.
+  const [baselineEdit, setBaselineEdit] = useState<{ from: string; to: string } | null>(null);
+  const baselineFrom = baselineEdit?.from ?? msToLocalInput(previewIncident.fromMs - DAY_MS);
+  const baselineTo = baselineEdit?.to ?? msToLocalInput(previewIncident.toMs - DAY_MS);
+
+  /** Resolve everything against ONE clock reading, at submit time. */
+  const boundsFor = (
+    nowMs: number
+  ): {
+    baseline_from_ns: number | null;
+    baseline_to_ns: number | null;
+    incident_from_ns: number | null;
+    incident_to_ns: number | null;
+  } => {
+    const incident = resolveRange(range, nowMs);
+    const baseline =
+      baselineEdit === null
+        ? { from: incident.fromNs - DAY_MS * NS_PER_MS, to: incident.toNs - DAY_MS * NS_PER_MS }
+        : { from: localInputToNs(baselineEdit.from), to: localInputToNs(baselineEdit.to) };
+    return {
+      baseline_from_ns: baseline.from,
+      baseline_to_ns: baseline.to,
+      incident_from_ns: incident.fromNs,
+      incident_to_ns: incident.toNs,
+    };
   };
+
+  const preview = boundsFor(previewIncident.toMs);
   const invalid =
     service.trim() === '' ||
-    Object.values(bounds).some((v) => v === null) ||
-    (bounds.baseline_from_ns as number) >= (bounds.baseline_to_ns as number) ||
-    (bounds.incident_from_ns as number) >= (bounds.incident_to_ns as number);
-
-  const suggestBaseline = (): void => {
-    const f = localInputToNs(incidentFrom);
-    const t = localInputToNs(incidentTo);
-    if (f === null || t === null) return;
-    setBaselineFrom(nsToLocalInput(f - DAY_MS * NS_PER_MS));
-    setBaselineTo(nsToLocalInput(t - DAY_MS * NS_PER_MS));
-  };
+    Object.values(preview).some((v) => v === null) ||
+    (preview.baseline_from_ns as number) >= (preview.baseline_to_ns as number) ||
+    (preview.incident_from_ns as number) >= (preview.incident_to_ns as number);
 
   // The hook supplies the generation guard the manual `abortRef.current === ctl`
   // dance used to approximate, plus elapsed (there was none) and a timeout
   // that is reported as a timeout rather than as an operator cancel.
-  const diff = useAsyncOp<DiffReport, [string, typeof bounds]>(
+  const diff = useAsyncOp<DiffReport, [string, ReturnType<typeof boundsFor>]>(
     async (ctx, svc, windows) => {
       const r = await fetch(`${API}/v1/diff`, {
         method: 'POST',
@@ -226,7 +290,8 @@ function InvestigateView(): ReactElement {
 
   const run = (): void => {
     if (invalid) return;
-    diff.run(service, bounds);
+    // Resolve "Last 1 hour" NOW, not when the page was opened.
+    diff.run(service, boundsFor(Date.now()));
   };
 
   // Errors here read "Error: 404: no summary data in the baseline window" —
@@ -253,21 +318,18 @@ function InvestigateView(): ReactElement {
             size="small"
             slotProps={{ input: { sx: { ...mono, fontSize: 13 } } }}
           />
+          {/* U11: the incident window IS the shared range. No second picker. */}
+          <TimeRangeControl
+            label="Incident (broken)"
+            hint="Shared with the dashboards and Explore — set it once, it follows you."
+          />
           <WindowFields
             label="Baseline (healthy)"
             from={baselineFrom}
             to={baselineTo}
-            onFrom={setBaselineFrom}
-            onTo={setBaselineTo}
+            onFrom={(v) => setBaselineEdit({ from: v, to: baselineTo })}
+            onTo={(v) => setBaselineEdit({ from: baselineFrom, to: v })}
             ariaPrefix="Baseline"
-          />
-          <WindowFields
-            label="Incident (broken)"
-            from={incidentFrom}
-            to={incidentTo}
-            onFrom={setIncidentFrom}
-            onTo={setIncidentTo}
-            ariaPrefix="Incident"
           />
         </Stack>
         <Stack direction="row" gap={1.5} alignItems="center" flexWrap="wrap" sx={{ mt: 2 }}>
@@ -275,9 +337,15 @@ function InvestigateView(): ReactElement {
           <Button variant="contained" onClick={run} disabled={invalid} {...asyncOpTriggerProps(diff.state)}>
             {running ? 'Running diff…' : 'Run diff'}
           </Button>
-          <Button variant="outlined" size="small" onClick={suggestBaseline}>
-            Suggest baseline (incident −24h)
-          </Button>
+          {baselineEdit === null ? (
+            <Typography variant="caption" color="text.secondary">
+              baseline tracks the incident window −24h
+            </Typography>
+          ) : (
+            <Button variant="outlined" size="small" onClick={() => setBaselineEdit(null)}>
+              Re-track baseline (incident −24h)
+            </Button>
+          )}
           {invalid && (
             <Typography variant="caption" color="warning.main">
               service + two valid windows (from &lt; to) required
@@ -390,9 +458,12 @@ function ReportView({ report }: { report: DiffReport }): ReactElement {
         incident {tsPretty(report.incident_window[0])} → {tsPretty(report.incident_window[1])} UTC
       </Typography>
       {/* This view always requests per-event normalization (per_unit_time
-          unset) — say so instead of leaving "rate" ambiguous. */}
+          unset) — say so instead of leaving "rate" ambiguous. The unit
+          matters twice over now that rates render as a percentage: the
+          percentage is OF THE WINDOW'S EVENTS, not of the baseline rate. */}
       <Typography variant="caption" color="text.secondary" display="block">
-        rates are per-event (count ÷ window events)
+        rates are per-event (count ÷ window events), shown as % of that window&apos;s events; Δ bars share one scale
+        within each section
       </Typography>
 
       {report.notes.length > 0 && (
@@ -405,9 +476,13 @@ function ReportView({ report }: { report: DiffReport }): ReactElement {
 
       {KIND_GROUPS.map(({ kind, title }) => {
         const rows = report.template_deltas.filter((d) => d.kind === kind);
+        // Biggest movers first: a ranked list is the point of the Δ column,
+        // and the section's own largest |Δ| is the bar scale.
+        const ranked = [...rows].sort((a, b) => Math.abs(b.rate_delta) - Math.abs(a.rate_delta));
+        const scale = maxAbs(ranked.map((d) => d.rate_delta));
         return (
           <ReportSection key={kind} title={`Templates — ${title}`}>
-            {rows.length === 0 ? (
+            {ranked.length === 0 ? (
               <NoChange />
             ) : (
               <table style={tableStyle}>
@@ -420,14 +495,14 @@ function ReportView({ report }: { report: DiffReport }): ReactElement {
                   </tr>
                 </thead>
                 <tbody>
-                  {rows.map((d, i) => (
+                  {ranked.map((d, i) => (
                     <tr key={i}>
                       <Td mono title={templateLabel(d)}>
                         {templateLabel(d).slice(0, 90)}
                       </Td>
                       <Td mono>{fmtRate(d.baseline_rate)}</Td>
                       <Td mono>{fmtRate(d.incident_rate)}</Td>
-                      <Td mono>{fmtDelta(d.rate_delta)}</Td>
+                      <DeltaCell value={d.rate_delta} scale={scale} />
                     </tr>
                   ))}
                 </tbody>
@@ -454,17 +529,19 @@ function ReportView({ report }: { report: DiffReport }): ReactElement {
               {report.quantile_shifts.map((q, i) => (
                 <tr key={i}>
                   <Td mono>{q.attribute}</Td>
+                  {/* Absolute units, not percentages: these sit beside the
+                      raw quantiles they moved between. */}
                   <Td mono>
                     {q.baseline_p50.toFixed(1)} → {q.incident_p50.toFixed(1)} (
-                    {fmtDelta(q.p50_delta)})
+                    {fmtNumDelta(q.p50_delta)})
                   </Td>
                   <Td mono>
                     {q.baseline_p95.toFixed(1)} → {q.incident_p95.toFixed(1)} (
-                    {fmtDelta(q.p95_delta)})
+                    {fmtNumDelta(q.p95_delta)})
                   </Td>
                   <Td mono>
                     {q.baseline_p99.toFixed(1)} → {q.incident_p99.toFixed(1)} (
-                    {fmtDelta(q.p99_delta)})
+                    {fmtNumDelta(q.p99_delta)})
                   </Td>
                 </tr>
               ))}
@@ -486,33 +563,7 @@ function ReportView({ report }: { report: DiffReport }): ReactElement {
                 — sketched mode: values not enumerable; movement shows in cardinality shifts.
               </Typography>
             ) : (
-              <Box key={i} sx={{ my: 1 }}>
-                <Typography variant="caption" sx={mono} color="text.secondary">
-                  {d.Full.attribute}
-                </Typography>
-                <table style={tableStyle}>
-                  <thead>
-                    <tr>
-                      <Th>Value</Th>
-                      <Th>Baseline rate</Th>
-                      <Th>Incident rate</Th>
-                      <Th>Δ rate</Th>
-                      <Th>Kind</Th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {d.Full.values.map((v, j) => (
-                      <tr key={j}>
-                        <Td mono>{v.value}</Td>
-                        <Td mono>{fmtRate(v.baseline_rate)}</Td>
-                        <Td mono>{fmtRate(v.incident_rate)}</Td>
-                        <Td mono>{fmtDelta(v.rate_delta)}</Td>
-                        <Td>{v.kind}</Td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
-              </Box>
+              <DimensionTable key={i} attribute={d.Full.attribute} values={d.Full.values} />
             )
           )
         )}
@@ -582,6 +633,89 @@ function ReportView({ report }: { report: DiffReport }): ReactElement {
         </ReportSection>
       )}
     </Box>
+  );
+}
+
+function DimensionTable(props: { attribute: string; values: DimValueDelta[] }): ReactElement {
+  const ranked = [...props.values].sort((a, b) => Math.abs(b.rate_delta) - Math.abs(a.rate_delta));
+  const scale = maxAbs(ranked.map((v) => v.rate_delta));
+  return (
+    <Box sx={{ my: 1 }}>
+      <Typography variant="caption" sx={mono} color="text.secondary">
+        {props.attribute}
+      </Typography>
+      <table style={tableStyle}>
+        <thead>
+          <tr>
+            <Th>Value</Th>
+            <Th>Baseline rate</Th>
+            <Th>Incident rate</Th>
+            <Th>Δ rate</Th>
+            <Th>Kind</Th>
+          </tr>
+        </thead>
+        <tbody>
+          {ranked.map((v, j) => (
+            <tr key={j}>
+              <Td mono>{v.value}</Td>
+              <Td mono>{fmtRate(v.baseline_rate)}</Td>
+              <Td mono>{fmtRate(v.incident_rate)}</Td>
+              <DeltaCell value={v.rate_delta} scale={scale} />
+              <Td>{v.kind}</Td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </Box>
+  );
+}
+
+/**
+ * The Δ column: the number, plus a bar on a scale shared by every row in the
+ * section. The number is what you quote; the bar is what makes the ranking
+ * readable without reading any of the numbers — which is the actual
+ * complaint behind U13.
+ *
+ * The bar diverges from a centre line so sign is a DIRECTION, not a colour
+ * you have to decode, and the two colours are warning/info rather than
+ * red/green: a rate that collapsed is not "good news", and a chart must not
+ * imply it is.
+ */
+function DeltaCell({ value, scale }: { value: number; scale: number }): ReactElement {
+  const frac = scale > 0 && Number.isFinite(value) ? Math.min(1, Math.abs(value) / scale) : 0;
+  const up = value > 0;
+  return (
+    <Td mono>
+      <Stack direction="row" gap={1} alignItems="center">
+        <Box component="span" sx={{ minWidth: 78, textAlign: 'right' }}>
+          {fmtDelta(value)}
+        </Box>
+        <Box
+          aria-hidden
+          data-testid="delta-bar"
+          sx={{
+            position: 'relative',
+            width: 72,
+            height: 6,
+            flexShrink: 0,
+            borderRadius: 3,
+            backgroundColor: 'rgba(127,127,127,0.15)',
+          }}
+        >
+          <Box
+            sx={{
+              position: 'absolute',
+              top: 0,
+              bottom: 0,
+              [up ? 'left' : 'right']: '50%',
+              width: `${frac * 50}%`,
+              borderRadius: 3,
+              backgroundColor: up ? 'warning.main' : 'info.main',
+            }}
+          />
+        </Box>
+      </Stack>
+    </Td>
   );
 }
 

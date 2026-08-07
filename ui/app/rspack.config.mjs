@@ -133,7 +133,12 @@ export default defineConfig({
         proxy: [
           {
             context: ['/api', '/proxy', '/plugins'],
-            target: 'http://localhost:8080',
+            // Perses backend. PERSES_PROXY_TARGET moves it off :8080 — a
+            // port a developer may already have occupied, which used to
+            // make the live-stack e2e suite unrunnable rather than merely
+            // inconvenient (U16). Same escape hatch as OBSESC_API_TARGET
+            // below; the default is unchanged.
+            target: process.env.PERSES_PROXY_TARGET ?? 'http://localhost:8080',
             // Module-federation entry manifests (mf-manifest.json) are
             // served un-hashed; heuristic browser caching pins stale
             // plugin bundles across rebuilds (hard reload does NOT bust
@@ -155,8 +160,9 @@ export default defineConfig({
           {
             // Prometheus (scrapes obsesc-node /metrics) on :9090.
             // Browser hits /prom-api/<path> → /<path>.
+            // PROM_API_TARGET moves it, for the same reason as above.
             context: ['/prom-api'],
-            target: 'http://localhost:9090',
+            target: process.env.PROM_API_TARGET ?? 'http://localhost:9090',
             pathRewrite: { '^/prom-api': '' },
           },
         ],

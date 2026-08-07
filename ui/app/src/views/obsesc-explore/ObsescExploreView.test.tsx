@@ -28,7 +28,8 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
 import { ThemeProvider, createTheme } from '@mui/material/styles';
-import ObsescExploreView from './ObsescExploreView';
+import { resetSharedTimeRange, setSharedTimeRange } from '../../hooks/use-shared-time-range';
+import ObsescExploreView, { applyRangeToSql } from './ObsescExploreView';
 
 // jsdom here predates AbortSignal.timeout, which the view's apiFetch uses.
 beforeAll(() => {
@@ -168,7 +169,7 @@ function makeRunBody(rows: Json[] = [], over: Json = {}): Json {
   return { rows, estimate: makePreview(), consumption: makeConsumption(), ...over };
 }
 
-function makeWindow(service: string, startNs: number): Record<string, unknown> {
+function makeWindow(service: string, startNs: number, over: Json = {}): Record<string, unknown> {
   return {
     service,
     window_start_ns: startNs,
@@ -177,6 +178,7 @@ function makeWindow(service: string, startNs: number): Record<string, unknown> {
     event_count: 42,
     bloom_match: true,
     saturated: false,
+    ...over,
   };
 }
 
@@ -185,6 +187,10 @@ let fetchMock: jest.Mock;
 beforeEach(() => {
   fetchMock = jest.fn();
   (globalThis as unknown as { fetch: unknown }).fetch = fetchMock;
+  // The shared time range (U11) is a MODULE store by design — a view has to
+  // be mountable without a provider or a Router — so it survives between
+  // tests unless it is cleared.
+  resetSharedTimeRange();
 });
 
 afterEach(() => {
@@ -629,5 +635,285 @@ describe('showback is absent by default', () => {
     // amount and label are ONE unit — the number alone would read as a price.
     expect(chip).toHaveTextContent('21.43 USD');
     expect(chip).toHaveTextContent('internal showback — OBSESC does not charge for queries');
+  });
+});
+
+// ───────────────────────────────────────────────────────────────────────
+// The app-view sweep — U8 (ranked needle results), U9 (inline drill),
+// U10 (no hand-editable epoch literals) and U11 (one time model).
+// ───────────────────────────────────────────────────────────────────────
+
+const NS_PER_MS = 1e6;
+
+/** Mount, search for a token, and wait for the ranked result to land. */
+async function searchWith(windows: Array<Record<string, unknown>>, extra: Json = {}): Promise<void> {
+  fetchMock.mockImplementation((url: string) => {
+    if (String(url).includes('/v1/search_tokens')) {
+      return Promise.resolve(jsonResponse({ windows, scanned_files: 9, ...extra }));
+    }
+    if (String(url).includes('/v1/sql/estimate')) return new Promise<Response>(() => {});
+    return Promise.resolve(jsonResponse({}));
+  });
+  renderExplore();
+  fireEvent.change(screen.getByLabelText(/^Token/), { target: { value: 'abc' } });
+  fireEvent.click(screen.getByRole('button', { name: /^Search/ }));
+  await waitFor(() => expect(screen.getByTestId('needle-summary')).toBeInTheDocument());
+}
+
+/** The from_ns/to_ns a /v1/search_tokens GET was issued with. */
+function searchWindow(mock: jest.Mock): { from: number; to: number } {
+  const call = mock.mock.calls.find((c) => String(c[0]).includes('/v1/search_tokens'));
+  const qs = new URLSearchParams(String(call?.[0]).split('?')[1] ?? '');
+  return { from: Number(qs.get('from_ns')), to: Number(qs.get('to_ns')) };
+}
+
+/** MUI puts `aria-label` on the FormControl root, so reach for the textarea. */
+function sqlText(): string {
+  return (document.querySelector('textarea') as HTMLTextAreaElement).value;
+}
+
+/** Both epoch-ns bounds out of the seeded `timestamp_ns` predicate. */
+function sqlBounds(): number[] {
+  return [...sqlText().matchAll(/timestamp_ns\s*(?:>=|<)\s*(\d+)/g)].map((m) => Number(m[1]));
+}
+
+describe('U10 — the time control owns the epoch-ns literals', () => {
+  it('rewrites the lower and upper bound, and only those', () => {
+    // 1_000 rows and a 3-digit port are not time bounds and must survive.
+    const sql =
+      'SELECT * FROM raw_events WHERE timestamp_ns >= 1785824670563000000 AND timestamp_ns < 1785828270563000000 AND port = 8080 LIMIT 1000';
+    const out = applyRangeToSql(sql, 111_000_000_000_000_000, 222_000_000_000_000_000);
+    expect(out.rewrote).toBe(2);
+    expect(out.sql).toContain('timestamp_ns >= 111000000000000000');
+    expect(out.sql).toContain('timestamp_ns < 222000000000000000');
+    expect(out.sql).toContain('port = 8080');
+    expect(out.sql).toContain('LIMIT 1000');
+  });
+
+  it('reads the operator, so a reversed predicate is not written backwards', () => {
+    const out = applyRangeToSql(
+      'WHERE timestamp_ns <= 1785828270563000000 AND timestamp_ns > 1785824670563000000',
+      111_000_000_000_000_000,
+      222_000_000_000_000_000
+    );
+    expect(out.sql).toContain('timestamp_ns <= 222000000000000000');
+    expect(out.sql).toContain('timestamp_ns > 111000000000000000');
+  });
+
+  it("rewrites a virtual column's window without touching its quoted template_key", () => {
+    // A TemplateKey is a u64 in the SAME digit class as an epoch-ns literal
+    // (19–20 digits). Only the trailing `, <ns>, <ns>)` pair may move.
+    const out = applyRangeToSql(
+      "SELECT * FROM template_events('svc-000', '18446744073709551615', 1785824670563000000, 1785828270563000000)",
+      111_000_000_000_000_000,
+      222_000_000_000_000_000
+    );
+    expect(out.rewrote).toBe(2);
+    expect(out.sql).toContain("'18446744073709551615'");
+    expect(out.sql).toContain('111000000000000000, 222000000000000000)');
+  });
+
+  it('reports zero rewrites rather than pretending, when there is no bound to own', () => {
+    const out = applyRangeToSql('SELECT 1', 1, 2);
+    expect(out.rewrote).toBe(0);
+    expect(out.sql).toBe('SELECT 1');
+  });
+
+  it('renders the seeded window in words beside the literals', () => {
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    renderExplore();
+    // U10's complaint in one line: `timestamp_ns >= 1785824670563000000` is
+    // not checkable by eye, so the same window is stated in UTC next to it.
+    expect(screen.getByTestId('sql-window')).toHaveTextContent(/Last hour/);
+    expect(screen.getByTestId('sql-window')).toHaveTextContent(
+      /\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} → \d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2} UTC/
+    );
+  });
+});
+
+describe('U11 — one range, four surfaces', () => {
+  it('seeds the SQL bounds from the shared range', () => {
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    renderExplore();
+    const [from, to] = sqlBounds();
+    expect(to! - from!).toBeCloseTo(3600e9, -9); // the 1h default
+  });
+
+  it('rewrites the SQL bounds when the range moves — no hand editing', () => {
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    renderExplore();
+    act(() => setSharedTimeRange({ kind: 'relative', duration: '24h' }));
+    const [from, to] = sqlBounds();
+    expect(to! - from!).toBeCloseTo(24 * 3600e9, -9);
+    expect(screen.getByTestId('sql-window')).toHaveTextContent(/Last 24 hours/);
+    expect(screen.getByTestId('sql-window')).toHaveTextContent(/rewrote 2 bounds/);
+  });
+
+  it('writes an ABSOLUTE range straight into the query', () => {
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    renderExplore();
+    act(() => setSharedTimeRange({ kind: 'absolute', startMs: 1_754_500_000_000, endMs: 1_754_503_600_000 }));
+    expect(sqlBounds()).toEqual([1_754_500_000_000 * NS_PER_MS, 1_754_503_600_000 * NS_PER_MS]);
+  });
+
+  it('searches the needle over the SAME range — the private Range dropdown is gone', async () => {
+    // The needle used to carry its own `Range` select seeded at 1h, which is
+    // half of what made moving an investigation between surfaces manual.
+    setSharedTimeRange({ kind: 'absolute', startMs: 1_754_500_000_000, endMs: 1_754_503_600_000 });
+    await searchWith([makeWindow('svc-one', 1_754_500_000_000 * NS_PER_MS)]);
+    expect(searchWindow(fetchMock)).toEqual({
+      from: 1_754_500_000_000 * NS_PER_MS,
+      to: 1_754_503_600_000 * NS_PER_MS,
+    });
+    expect(screen.queryByLabelText('Range')).not.toBeInTheDocument();
+  });
+
+  it('renders exactly ONE time control on the page', () => {
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    renderExplore();
+    expect(screen.getAllByTestId('time-range-control')).toHaveLength(1);
+  });
+});
+
+describe('U8 — the needle result is ranked, not a wall', () => {
+  /** The finding's shape, in miniature: one corroborated needle, a saturated flood. */
+  function haystack(): Array<Record<string, unknown>> {
+    const out: Array<Record<string, unknown>> = [];
+    for (let i = 0; i < 12; i++) {
+      out.push(makeWindow(`flood-${i % 4}`, i * 3600e9, { saturated: true }));
+    }
+    out.push(makeWindow('auth-gateway', 99 * 3600e9, { needle: 'candidate' }));
+    return out;
+  }
+
+  it('puts the corroborated service first and says why', async () => {
+    await searchWith(haystack());
+    expect(screen.getByTestId('needle-start-here')).toHaveTextContent(/Start with auth-gateway/);
+    const headers = screen.getAllByTestId('needle-group-header');
+    expect(headers[0]).toHaveTextContent('auth-gateway');
+    expect(headers[0]).toHaveTextContent('index-corroborated');
+  });
+
+  it('counts every verdict in the headline — nothing is filtered away', async () => {
+    await searchWith(haystack());
+    expect(screen.getByTestId('needle-summary')).toHaveTextContent('13 candidate windows across 5 services');
+    expect(screen.getByText('12 bloom saturated')).toBeInTheDocument();
+    expect(screen.getByText('1 index-corroborated')).toBeInTheDocument();
+  });
+
+  it('collapses contiguous same-verdict windows into one row', async () => {
+    // Three abutting five-minute windows are ONE fact. This is what turns
+    // 4,056 rows into a page.
+    await searchWith([makeWindow('svc', 0), makeWindow('svc', 300e9), makeWindow('svc', 600e9)]);
+    const rows = screen.getAllByTestId('needle-window-row');
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toHaveTextContent('3 contiguous windows');
+    expect(rows[0]).toHaveTextContent('126 events');
+  });
+
+  it('offers the one-click service filter the operator had to type by hand', async () => {
+    await searchWith(haystack());
+    const header = screen.getAllByTestId('needle-group-header')[0]!;
+    fireEvent.click(within(header).getByText('only this service'));
+    expect(screen.getByLabelText(/^Service/)).toHaveValue('auth-gateway');
+  });
+
+  it('refuses to dress an all-saturated result up as a ranking', async () => {
+    await searchWith([makeWindow('svc', 0, { saturated: true })]);
+    expect(screen.getByTestId('needle-start-here')).toHaveTextContent(/SATURATED/);
+    expect(screen.getByTestId('needle-start-here')).toHaveTextContent(/prunes nothing/);
+  });
+
+  it('admits when the needle index did not run at all', async () => {
+    await searchWith([makeWindow('svc', 0)], { needle: null, needle_pruned_windows: 0 });
+    expect(screen.getByTestId('needle-probe-notes')).toHaveTextContent(/No needle-index assist ran/);
+  });
+
+  it('reports the windows the index PROVED token-free as excluded, not hidden', async () => {
+    await searchWith([makeWindow('svc', 0)], {
+      needle_pruned_windows: 118,
+      needle: {
+        slabs_probed: 4,
+        manifests_probed: 0,
+        probe_bytes: 12_288,
+        covered_files: 900,
+        unindexed_files: 0,
+        listing_failed: false,
+      },
+    });
+    expect(screen.getByTestId('needle-probe-notes')).toHaveTextContent(/118 windows removed/);
+    expect(screen.getByTestId('needle-probe-notes')).toHaveTextContent(/not hidden, they are excluded/);
+  });
+
+  it('fails loudly when a node answers without a window list', async () => {
+    // An empty list is a real answer ("the blooms pruned everything"), so a
+    // MISSING list must never be able to impersonate one.
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).includes('/v1/search_tokens')) return Promise.resolve(jsonResponse({ scanned_files: 3 }));
+      if (String(url).includes('/v1/sql/estimate')) return new Promise<Response>(() => {});
+      return Promise.resolve(jsonResponse({}));
+    });
+    renderExplore();
+    fireEvent.change(screen.getByLabelText(/^Token/), { target: { value: 'abc' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Search/ }));
+    await waitFor(() => expect(screen.getByTestId('asyncop-needle-search')).toHaveAttribute('data-phase', 'error'));
+    expect(screen.queryByTestId('needle-summary')).not.toBeInTheDocument();
+  });
+});
+
+describe('U9 — the drill answer renders under the row that asked', () => {
+  it('renders the result immediately after the clicked row, not after the list', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).includes('/v1/search_tokens')) {
+        return Promise.resolve(
+          jsonResponse({
+            windows: [makeWindow('svc-a', 0), makeWindow('svc-b', 3600e9), makeWindow('svc-c', 7200e9)],
+            scanned_files: 9,
+          })
+        );
+      }
+      if (String(url).includes('/v1/raw_grep')) {
+        return Promise.resolve(
+          jsonResponse({
+            events: [
+              {
+                timestamp_ns: 3600e9,
+                source: 'otlp',
+                service: 'svc-b',
+                body_utf8: 'THE-ANSWER',
+                attributes: {},
+              },
+            ],
+            truncated: false,
+            files_scanned: 1,
+          })
+        );
+      }
+      if (String(url).includes('/v1/sql/estimate')) return new Promise<Response>(() => {});
+      return Promise.resolve(jsonResponse({}));
+    });
+    renderExplore();
+    fireEvent.change(screen.getByLabelText(/^Token/), { target: { value: 'abc' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Search/ }));
+    await waitFor(() => expect(screen.getAllByTestId('needle-window-row')).toHaveLength(3));
+
+    fireEvent.click(screen.getAllByTestId('needle-window-row')[1]!);
+    await waitFor(() => expect(screen.getByTestId('needle-drill-panel')).toHaveTextContent('THE-ANSWER'));
+
+    // THE assertion: the panel is the clicked row's immediate sibling. It
+    // used to live after the whole candidate list, so clicking row 11 of 50
+    // put the answer below row 50 — reachable only by pressing End.
+    const rows = screen.getAllByTestId('needle-window-row');
+    expect(rows[1]!.nextElementSibling).toContainElement(screen.getByTestId('needle-drill-panel'));
+    expect(rows[2]!.nextElementSibling).toBeNull();
+  });
+
+  it('greps the whole collapsed run in ONE request', async () => {
+    await searchWith([makeWindow('svc', 0), makeWindow('svc', 300e9)]);
+    fireEvent.click(screen.getAllByTestId('needle-window-row')[0]!);
+    await waitFor(() => expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('/v1/raw_grep'))).toBe(true));
+    const grep = fetchMock.mock.calls.filter((c) => String(c[0]).includes('/v1/raw_grep'));
+    expect(grep).toHaveLength(1);
+    expect(bodyOf(grep[0])).toMatchObject({ service: 'svc', from_ns: 0, to_ns: 600e9 });
   });
 });
