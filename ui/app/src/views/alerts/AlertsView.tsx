@@ -88,6 +88,55 @@ function StatusChip({ status }: { status: AlertStatus }): ReactElement {
   return <Chip size="small" label="resolved" sx={{ color: 'text.secondary' }} />;
 }
 
+/**
+ * The "Windows" cell (U23). A resolved alert reads **0** here, and 0 is the
+ * literal truth on the wire — `SeriesAlertState.consecutive_windows` is
+ * documented "`0` after resolution" and `apply_flush` zeroes it on the
+ * Firing → Resolved edge (obsesc-alert/src/state.rs). The rig that produced
+ * this finding had 9 fired / 9 resolved and nothing still firing, so every
+ * visible row was a resolved one and the whole column read 0.
+ *
+ * A run length the backend deliberately discarded must NOT be rendered as
+ * the number zero: "held for zero windows" is a different — and false —
+ * claim from "the run ended when this resolved". So a resolved row renders
+ * an em dash carrying the reason, and the number is reserved for the states
+ * where it is a live measurement. A 0 on a firing/pending row would mean the
+ * node did not populate the field at all (pre-U23 node, or a drifted body),
+ * which gets its own honest label rather than being silently plausible.
+ */
+export interface WindowsCell {
+  text: string;
+  /** `null` when the number stands on its own. */
+  why: string | null;
+}
+
+export function consecutiveWindowsCell(alert: Pick<ObsescAlert, 'status' | 'consecutive_windows'>): WindowsCell {
+  const n = alert.consecutive_windows;
+  if (typeof n === 'number' && n > 0) return { text: String(n), why: null };
+  return {
+    text: '—',
+    why:
+      alert.status === 'resolved'
+        ? 'The consecutive-window run is cleared when an alert resolves — the node does not retain how long it held.'
+        : 'This node reported no consecutive-window count for a live alert (field absent or zero on the wire).',
+  };
+}
+
+function ConsecutiveWindowsCell({ alert }: { alert: ObsescAlert }): ReactElement {
+  const cell = consecutiveWindowsCell(alert);
+  const body = (
+    <Typography
+      variant="body2"
+      color={cell.why === null ? undefined : 'text.secondary'}
+      sx={mono}
+      data-testid="alert-windows"
+    >
+      {cell.text}
+    </Typography>
+  );
+  return cell.why === null ? body : <Tooltip title={cell.why}>{body}</Tooltip>;
+}
+
 function AlertRow({ alert }: { alert: ObsescAlert }): ReactElement {
   return (
     <TableRow hover>
@@ -120,9 +169,7 @@ function AlertRow({ alert }: { alert: ObsescAlert }): ReactElement {
         </Link>
       </TableCell>
       <TableCell align="right" sx={{ verticalAlign: 'top' }}>
-        <Typography variant="body2" sx={mono}>
-          {alert.consecutive_windows}
-        </Typography>
+        <ConsecutiveWindowsCell alert={alert} />
       </TableCell>
       <TableCell sx={{ whiteSpace: 'nowrap', verticalAlign: 'top' }}>
         <Tooltip title={`window ${tsLocal(alert.window_start_ns)} → ${tsLocal(alert.window_end_ns)}`}>
@@ -341,7 +388,7 @@ export default function AlertsView(): ReactElement {
                 <TableCell>Predicate</TableCell>
                 <TableCell>Service</TableCell>
                 <TableCell align="right">
-                  <Tooltip title="Consecutive windows the predicate has held">
+                  <Tooltip title="Consecutive windows the predicate has held. Cleared on resolve — a resolved row shows — , never 0.">
                     <span>Windows</span>
                   </Tooltip>
                 </TableCell>
