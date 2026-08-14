@@ -169,17 +169,55 @@ function makeRunBody(rows: Json[] = [], over: Json = {}): Json {
   return { rows, estimate: makePreview(), consumption: makeConsumption(), ...over };
 }
 
-function makeWindow(service: string, startNs: number, over: Json = {}): Record<string, unknown> {
+// ─── the needle wire ───────────────────────────────────────────────────
+//
+// `POST /v1/needle`. The box used to call `GET /v1/search_tokens`, which is
+// structurally unbounded — it walks the summary tier from the root and fully
+// decodes every .obsc file it finds regardless of the requested range, 363,012
+// of them on one node of the 9 TB cluster — and therefore never returned at
+// all. These fixtures are the shape of the endpoint that does.
+
+/** One signature-covered candidate: the index flagged specific rowgroups. */
+function makeCandidate(file: string, over: Json = {}): Json {
+  return { file, size_bytes: 1000, indexed: true, total_rowgroups: 4, rowgroups: [0], ...over };
+}
+
+/** A file no signature covers — kept whole, and honestly labelled as such. */
+function makeUncovered(file: string, over: Json = {}): Json {
+  return { file, size_bytes: 600, indexed: false, total_rowgroups: 0, rowgroups: null, ...over };
+}
+
+function makeNeedleStats(over: Json = {}): Json {
   return {
-    service,
-    window_start_ns: startNs,
-    window_end_ns: startNs + 300e9,
-    windows_merged: 1,
-    event_count: 42,
-    bloom_match: true,
-    saturated: false,
+    slabs_probed: 4,
+    manifests_probed: 0,
+    probe_bytes: 12_288,
+    covered_files: 900,
+    unindexed_files: 0,
+    listing_failed: false,
+    manifest_budget_exhausted: false,
     ...over,
   };
+}
+
+/** `POST /v1/needle` 200. */
+function makeNeedleBody(candidates: Json[] = [], over: Json = {}): Json {
+  return {
+    token: 'abc',
+    from_ns: 0,
+    to_ns: 1,
+    candidates,
+    stats: makeNeedleStats(),
+    scan_estimate: makePreview(),
+    approximate: true,
+    note: 'membership-only: candidates are a superset (signature FPR; unindexed files are whole-file candidates)…',
+    ...over,
+  };
+}
+
+/** A raw key in the hour partition the UI groups by. */
+function key(day: string, hour: string, name = 'a', shard = 0): string {
+  return `raw/shard-${shard}/${day.replaceAll('-', '/')}/${hour}/${name}.parquet`;
 }
 
 let fetchMock: jest.Mock;
@@ -268,7 +306,7 @@ describe('needle search — stale-response race', () => {
     const fast = deferred<Response>();
     let search = 0;
     fetchMock.mockImplementation((url: string) => {
-      if (String(url).includes('/v1/search_tokens')) {
+      if (String(url).includes('/v1/needle')) {
         search += 1;
         return search === 1 ? slow.promise : fast.promise;
       }
@@ -285,38 +323,120 @@ describe('needle search — stale-response race', () => {
     fireEvent.change(tokenInput, { target: { value: 'abcdef' } });
     fireEvent.click(searchBtn);
 
-    fast.resolve(jsonResponse({ windows: [makeWindow('svc-newer', 2_000_000_000_000_000)], scanned_files: 7 }));
-    await waitFor(() => expect(screen.getByText('svc-newer')).toBeInTheDocument());
+    fast.resolve(jsonResponse(makeNeedleBody([makeCandidate(key('2026-08-09', '01'))])));
+    await waitFor(() => expect(screen.getByText('2026-08-09')).toBeInTheDocument());
 
-    slow.resolve(jsonResponse({ windows: [makeWindow('svc-older', 1_000_000_000_000_000)], scanned_files: 3 }));
+    slow.resolve(jsonResponse(makeNeedleBody([makeCandidate(key('2026-08-02', '05'))])));
     await settle();
-    expect(screen.getByText('svc-newer')).toBeInTheDocument();
-    expect(screen.queryByText('svc-older')).not.toBeInTheDocument();
+    expect(screen.getByText('2026-08-09')).toBeInTheDocument();
+    expect(screen.queryByText('2026-08-02')).not.toBeInTheDocument();
+  });
+});
+
+describe('the needle box calls the endpoint that can answer', () => {
+  it('POSTs /v1/needle and never touches /v1/search_tokens', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).includes('/v1/needle')) return Promise.resolve(jsonResponse(makeNeedleBody()));
+      if (String(url).includes('/v1/sql/estimate')) return new Promise<Response>(() => {});
+      return Promise.resolve(jsonResponse({}));
+    });
+    renderExplore();
+    fireEvent.change(screen.getByLabelText(/^Token/), { target: { value: 'ORD-7741' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Search/ }));
+    await waitFor(() => expect(screen.getByTestId('needle-summary')).toBeInTheDocument());
+
+    // `GET /v1/search_tokens` is not merely slower: it walks the summary tier
+    // from the root and decodes every .obsc file whatever range you asked
+    // for, so it cannot answer at estate scale at all. One call, to the other
+    // endpoint, by POST.
+    const calls = fetchMock.mock.calls.map((c) => String(c[0]));
+    expect(calls.filter((u) => u.includes('/v1/search_tokens'))).toHaveLength(0);
+    const needle = fetchMock.mock.calls.filter((c) => String(c[0]).includes('/v1/needle'));
+    expect(needle).toHaveLength(1);
+    expect((needle[0]![1] as RequestInit).method).toBe('POST');
+    expect(bodyOf(needle[0])).toMatchObject({ token: 'ORD-7741' });
+  });
+
+  it('sends no `service` — the needle index is service-blind by construction', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).includes('/v1/needle')) return Promise.resolve(jsonResponse(makeNeedleBody()));
+      if (String(url).includes('/v1/sql/estimate')) return new Promise<Response>(() => {});
+      return Promise.resolve(jsonResponse({}));
+    });
+    renderExplore();
+    fireEvent.change(screen.getByLabelText(/^Token/), { target: { value: 'abc' } });
+    fireEvent.change(screen.getByLabelText(/^Service/), { target: { value: 'svc-a' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Search/ }));
+    await waitFor(() => expect(screen.getByTestId('needle-summary')).toBeInTheDocument());
+    const needle = fetchMock.mock.calls.filter((c) => String(c[0]).includes('/v1/needle'));
+    // The service box drives the DRILL only. Sending it would advertise a
+    // filter the endpoint does not have.
+    expect(bodyOf(needle[0])).not.toHaveProperty('service');
+  });
+});
+
+describe('P4-2 — a raw JS exception must never reach the operator', () => {
+  it('renders a fault and a next step when the fetch itself rejects', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).includes('/v1/needle')) return Promise.reject(new TypeError('Failed to fetch'));
+      if (String(url).includes('/v1/sql/estimate')) return new Promise<Response>(() => {});
+      return Promise.resolve(jsonResponse({}));
+    });
+    renderExplore();
+    fireEvent.change(screen.getByLabelText(/^Token/), { target: { value: 'abc' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Search/ }));
+
+    const alert = await screen.findByTestId('needle-search-error');
+    expect(alert).toHaveTextContent('Could not reach the node, so the needle search never ran.');
+    expect(alert).toHaveTextContent(/\/obsesc-api/);
+    // THE assertion. The box used to render, verbatim, "TypeError: Failed to
+    // fetch" under "✗ failed after 0.1s".
+    expect(document.body.textContent ?? '').not.toContain('TypeError');
+    // The elapsed indicator is good and stays.
+    expect(screen.getByTestId('asyncop-needle-search')).toHaveAttribute('data-phase', 'error');
+    expect(screen.getByTestId('asyncop-needle-search')).toHaveTextContent(/✗ failed after/);
+  });
+
+  it('keeps the server 400 verbatim instead of paraphrasing it', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).includes('/v1/needle')) {
+        return Promise.resolve({
+          ok: false,
+          status: 400,
+          text: async () => 'range exceeds the retention horizon (90 days)',
+          json: async () => ({}),
+        } as unknown as Response);
+      }
+      if (String(url).includes('/v1/sql/estimate')) return new Promise<Response>(() => {});
+      return Promise.resolve(jsonResponse({}));
+    });
+    renderExplore();
+    fireEvent.change(screen.getByLabelText(/^Token/), { target: { value: 'abc' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Search/ }));
+    const alert = await screen.findByTestId('needle-search-error');
+    expect(alert).toHaveTextContent('range exceeds the retention horizon (90 days)');
   });
 });
 
 describe('needle drill — stale-response race and per-row busy state', () => {
-  async function searchTwoWindows(): Promise<HTMLElement[]> {
+  /** Two candidate hours, with a service named so the drill is reachable. */
+  async function searchTwoHours(): Promise<HTMLElement[]> {
     renderExplore();
     fireEvent.change(screen.getByLabelText(/^Token/), { target: { value: 'abc' } });
+    fireEvent.change(screen.getByLabelText(/^Service/), { target: { value: 'svc-one' } });
     fireEvent.click(screen.getByRole('button', { name: /^Search/ }));
-    await waitFor(() => expect(screen.getByText('svc-one')).toBeInTheDocument());
-    return screen.getAllByTitle('Grep this window for verbatim matches');
+    await waitFor(() => expect(screen.getAllByTestId('needle-window-row')).toHaveLength(2));
+    return screen.getAllByTitle('Grep this hour of svc-one for verbatim matches');
   }
+
+  const TWO_HOURS = [makeUncovered(key('2026-08-07', '01')), makeUncovered(key('2026-08-07', '02'))];
 
   it('renders the NEWER drill even when the older one resolves last', async () => {
     const slow = deferred<Response>();
     const fast = deferred<Response>();
     let grep = 0;
     fetchMock.mockImplementation((url: string) => {
-      if (String(url).includes('/v1/search_tokens')) {
-        return Promise.resolve(
-          jsonResponse({
-            windows: [makeWindow('svc-one', 1_000_000_000_000_000), makeWindow('svc-two', 2_000_000_000_000_000)],
-            scanned_files: 9,
-          })
-        );
-      }
+      if (String(url).includes('/v1/needle')) return Promise.resolve(jsonResponse(makeNeedleBody(TWO_HOURS)));
       if (String(url).includes('/v1/raw_grep')) {
         grep += 1;
         return grep === 1 ? slow.promise : fast.promise;
@@ -324,7 +444,7 @@ describe('needle drill — stale-response race and per-row busy state', () => {
       return Promise.resolve(jsonResponse({}));
     });
 
-    const rows = await searchTwoWindows();
+    const rows = await searchTwoHours();
     fireEvent.click(rows[0]!);
     fireEvent.click(rows[1]!);
 
@@ -368,25 +488,40 @@ describe('needle drill — stale-response race and per-row busy state', () => {
   it('marks the clicked row busy while its grep runs and clears it after', async () => {
     const grep = deferred<Response>();
     fetchMock.mockImplementation((url: string) => {
-      if (String(url).includes('/v1/search_tokens')) {
-        return Promise.resolve(
-          jsonResponse({
-            windows: [makeWindow('svc-one', 1_000_000_000_000_000), makeWindow('svc-two', 2_000_000_000_000_000)],
-            scanned_files: 9,
-          })
-        );
-      }
+      if (String(url).includes('/v1/needle')) return Promise.resolve(jsonResponse(makeNeedleBody(TWO_HOURS)));
       if (String(url).includes('/v1/raw_grep')) return grep.promise;
       return Promise.resolve(jsonResponse({}));
     });
 
-    const rows = await searchTwoWindows();
+    const rows = await searchTwoHours();
     fireEvent.click(rows[0]!);
     await waitFor(() => expect(rows[0]!).toHaveAttribute('aria-busy', 'true'));
     expect(rows[1]!).not.toHaveAttribute('aria-busy', 'true');
 
     grep.resolve(jsonResponse({ events: [], truncated: false, files_scanned: 4 }));
     await waitFor(() => expect(rows[0]!).toHaveAttribute('aria-busy', 'false'));
+  });
+
+  it('does not offer a grep it cannot run — no service, no request', async () => {
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).includes('/v1/needle')) return Promise.resolve(jsonResponse(makeNeedleBody(TWO_HOURS)));
+      if (String(url).includes('/v1/sql/estimate')) return new Promise<Response>(() => {});
+      return Promise.resolve(jsonResponse({}));
+    });
+    renderExplore();
+    fireEvent.change(screen.getByLabelText(/^Token/), { target: { value: 'abc' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Search/ }));
+    await waitFor(() => expect(screen.getAllByTestId('needle-window-row')).toHaveLength(2));
+
+    // The raw grep matches `service` EXACTLY at the reader, and the needle
+    // index does not record which service a file's rows belong to — that is
+    // what makes an estate-wide sweep possible. So the affordance says what
+    // is missing instead of firing a request that can only return nothing.
+    expect(screen.getByTestId('needle-drill-hint')).toHaveTextContent(/Name a service above/);
+    fireEvent.click(screen.getAllByTestId('needle-window-row')[0]!);
+    await settle();
+    expect(fetchMock.mock.calls.filter((c) => String(c[0]).includes('/v1/raw_grep'))).toHaveLength(0);
+    expect(screen.queryByTestId('needle-drill-panel')).not.toBeInTheDocument();
   });
 });
 
@@ -645,26 +780,27 @@ describe('showback is absent by default', () => {
 
 const NS_PER_MS = 1e6;
 
-/** Mount, search for a token, and wait for the ranked result to land. */
-async function searchWith(windows: Array<Record<string, unknown>>, extra: Json = {}): Promise<void> {
+/** Mount, probe for a token, and wait for the ranked result to land. */
+async function searchWith(candidates: Json[], extra: Json = {}, service = ''): Promise<void> {
   fetchMock.mockImplementation((url: string) => {
-    if (String(url).includes('/v1/search_tokens')) {
-      return Promise.resolve(jsonResponse({ windows, scanned_files: 9, ...extra }));
+    if (String(url).includes('/v1/needle')) {
+      return Promise.resolve(jsonResponse(makeNeedleBody(candidates, extra)));
     }
     if (String(url).includes('/v1/sql/estimate')) return new Promise<Response>(() => {});
     return Promise.resolve(jsonResponse({}));
   });
   renderExplore();
   fireEvent.change(screen.getByLabelText(/^Token/), { target: { value: 'abc' } });
+  if (service !== '') fireEvent.change(screen.getByLabelText(/^Service/), { target: { value: service } });
   fireEvent.click(screen.getByRole('button', { name: /^Search/ }));
   await waitFor(() => expect(screen.getByTestId('needle-summary')).toBeInTheDocument());
 }
 
-/** The from_ns/to_ns a /v1/search_tokens GET was issued with. */
+/** The from_ns/to_ns the `POST /v1/needle` body carried. */
 function searchWindow(mock: jest.Mock): { from: number; to: number } {
-  const call = mock.mock.calls.find((c) => String(c[0]).includes('/v1/search_tokens'));
-  const qs = new URLSearchParams(String(call?.[0]).split('?')[1] ?? '');
-  return { from: Number(qs.get('from_ns')), to: Number(qs.get('to_ns')) };
+  const call = mock.mock.calls.find((c) => String(c[0]).includes('/v1/needle'));
+  const body = bodyOf(call);
+  return { from: Number(body.from_ns), to: Number(body.to_ns) };
 }
 
 /** MUI puts `aria-label` on the FormControl root, so reach for the textarea. */
@@ -760,7 +896,7 @@ describe('U11 — one range, four surfaces', () => {
     // The needle used to carry its own `Range` select seeded at 1h, which is
     // half of what made moving an investigation between surfaces manual.
     setSharedTimeRange({ kind: 'absolute', startMs: 1_754_500_000_000, endMs: 1_754_503_600_000 });
-    await searchWith([makeWindow('svc-one', 1_754_500_000_000 * NS_PER_MS)]);
+    await searchWith([makeCandidate(key('2026-08-07', '01'))]);
     expect(searchWindow(fetchMock)).toEqual({
       from: 1_754_500_000_000 * NS_PER_MS,
       to: 1_754_503_600_000 * NS_PER_MS,
@@ -776,80 +912,110 @@ describe('U11 — one range, four surfaces', () => {
 });
 
 describe('U8 — the needle result is ranked, not a wall', () => {
-  /** The finding's shape, in miniature: one corroborated needle, a saturated flood. */
-  function haystack(): Array<Record<string, unknown>> {
-    const out: Array<Record<string, unknown>> = [];
+  /**
+   * The finding's shape, in miniature: a spread of uncovered files the index
+   * could not rule out, and one day where the signatures actually flagged
+   * something. The old wire's version of this was 4,056 identical rows.
+   */
+  function haystack(): Json[] {
+    const out: Json[] = [];
     for (let i = 0; i < 12; i++) {
-      out.push(makeWindow(`flood-${i % 4}`, i * 3600e9, { saturated: true }));
+      out.push(makeUncovered(key('2026-08-0' + ((i % 4) + 1), String(i % 24).padStart(2, '0'), `f${i}`)));
     }
-    out.push(makeWindow('auth-gateway', 99 * 3600e9, { needle: 'candidate' }));
+    out.push(makeCandidate(key('2026-08-09', '11', 'needle')));
     return out;
   }
 
-  it('puts the corroborated service first and says why', async () => {
+  it('puts the signature-flagged day first and says why', async () => {
     await searchWith(haystack());
-    expect(screen.getByTestId('needle-start-here')).toHaveTextContent(/Start with auth-gateway/);
+    expect(screen.getByTestId('needle-start-here')).toHaveTextContent(/Start with 2026-08-09/);
     const headers = screen.getAllByTestId('needle-group-header');
-    expect(headers[0]).toHaveTextContent('auth-gateway');
-    expect(headers[0]).toHaveTextContent('index-corroborated');
+    expect(headers[0]).toHaveTextContent('2026-08-09');
+    expect(headers[0]).toHaveTextContent('signature-flagged');
   });
 
   it('counts every verdict in the headline — nothing is filtered away', async () => {
     await searchWith(haystack());
-    expect(screen.getByTestId('needle-summary')).toHaveTextContent('13 candidate windows across 5 services');
-    expect(screen.getByText('12 bloom saturated')).toBeInTheDocument();
-    expect(screen.getByText('1 index-corroborated')).toBeInTheDocument();
+    expect(screen.getByTestId('needle-summary')).toHaveTextContent('13 candidate files across 5 days');
+    expect(screen.getByText('12 not covered (whole file kept)')).toBeInTheDocument();
+    expect(screen.getByText('1 signature-flagged')).toBeInTheDocument();
   });
 
-  it('collapses contiguous same-verdict windows into one row', async () => {
-    // Three abutting five-minute windows are ONE fact. This is what turns
-    // 4,056 rows into a page.
-    await searchWith([makeWindow('svc', 0), makeWindow('svc', 300e9), makeWindow('svc', 600e9)]);
+  it('merges every shard’s files for one hour into one row', async () => {
+    // Three shards' candidates for 14:00 are ONE fact about 14:00, and the
+    // drill greps that hour once. This is what keeps a 90-day sweep readable.
+    await searchWith([
+      makeCandidate(key('2026-08-07', '14', 'a', 0)),
+      makeCandidate(key('2026-08-07', '14', 'b', 1)),
+      makeCandidate(key('2026-08-07', '14', 'c', 2)),
+    ]);
     const rows = screen.getAllByTestId('needle-window-row');
     expect(rows).toHaveLength(1);
-    expect(rows[0]).toHaveTextContent('3 contiguous windows');
-    expect(rows[0]).toHaveTextContent('126 events');
+    expect(rows[0]).toHaveTextContent('14:00 → 15:00 UTC');
+    expect(rows[0]).toHaveTextContent('3 files');
   });
 
-  it('offers the one-click service filter the operator had to type by hand', async () => {
-    await searchWith(haystack());
-    const header = screen.getAllByTestId('needle-group-header')[0]!;
-    fireEvent.click(within(header).getByText('only this service'));
-    expect(screen.getByLabelText(/^Service/)).toHaveValue('auth-gateway');
-  });
-
-  it('refuses to dress an all-saturated result up as a ranking', async () => {
-    await searchWith([makeWindow('svc', 0, { saturated: true })]);
-    expect(screen.getByTestId('needle-start-here')).toHaveTextContent(/SATURATED/);
-    expect(screen.getByTestId('needle-start-here')).toHaveTextContent(/prunes nothing/);
-  });
-
-  it('admits when the needle index did not run at all', async () => {
-    await searchWith([makeWindow('svc', 0)], { needle: null, needle_pruned_windows: 0 });
-    expect(screen.getByTestId('needle-probe-notes')).toHaveTextContent(/No needle-index assist ran/);
-  });
-
-  it('reports the windows the index PROVED token-free as excluded, not hidden', async () => {
-    await searchWith([makeWindow('svc', 0)], {
-      needle_pruned_windows: 118,
-      needle: {
-        slabs_probed: 4,
-        manifests_probed: 0,
-        probe_bytes: 12_288,
-        covered_files: 900,
-        unindexed_files: 0,
-        listing_failed: false,
-      },
-    });
-    expect(screen.getByTestId('needle-probe-notes')).toHaveTextContent(/118 windows removed/);
+  it('states the proven absences, which is the half that matters', async () => {
+    // 900 files in range carry signatures; one of them is a candidate. The
+    // other 899 are EXACT absences, and that is the claim no scan-based
+    // search can make.
+    await searchWith([makeCandidate(key('2026-08-07', '14'))]);
+    expect(screen.getByTestId('needle-summary')).toHaveTextContent('899 files proven token-free');
+    expect(screen.getByTestId('needle-probe-notes')).toHaveTextContent(/PROVABLY do not contain the token/);
     expect(screen.getByTestId('needle-probe-notes')).toHaveTextContent(/not hidden, they are excluded/);
   });
 
-  it('fails loudly when a node answers without a window list', async () => {
-    // An empty list is a real answer ("the blooms pruned everything"), so a
-    // MISSING list must never be able to impersonate one.
+  it('reports what the probe itself cost, because that is the point', async () => {
+    await searchWith([makeCandidate(key('2026-08-07', '14'))]);
+    expect(screen.getByTestId('needle-probe-notes')).toHaveTextContent(/Probe read 12 KiB/);
+    expect(screen.getByTestId('needle-probe-notes')).toHaveTextContent(/bounded by the index, not by the estate/);
+  });
+
+  it('renders the node’s honesty note verbatim rather than re-wording it', async () => {
+    await searchWith([makeCandidate(key('2026-08-07', '14'))]);
+    expect(screen.getByTestId('needle-honesty')).toHaveTextContent(/membership-only/);
+  });
+
+  it('stands the survivor-scan ceiling next to the bounded probe', async () => {
+    // The probe is bounded; scanning what survived is NOT, and the node hands
+    // back the ceiling for exactly that follow-up.
+    await searchWith([makeCandidate(key('2026-08-07', '14'))]);
+    expect(screen.getByTestId('scan-ceiling')).toHaveTextContent('up to 133.9 GiB on disk');
+  });
+
+  it('refuses to dress an all-uncovered result up as a ranking', async () => {
+    await searchWith([makeUncovered(key('2026-08-07', '14'))]);
+    expect(screen.getByTestId('needle-start-here')).toHaveTextContent(/Nothing here is signature-covered/);
+    expect(screen.getByTestId('needle-start-here')).toHaveTextContent(/could not be ruled out/);
+  });
+
+  it('admits when the node returned no probe stats at all', async () => {
+    await searchWith([makeUncovered(key('2026-08-07', '14'))], { stats: null });
+    expect(screen.getByTestId('needle-probe-notes')).toHaveTextContent(/returned no probe stats/);
+  });
+
+  it('surfaces a degraded probe instead of quietly ranking on it', async () => {
+    await searchWith([makeUncovered(key('2026-08-07', '14'))], {
+      stats: makeNeedleStats({ listing_failed: true, manifest_budget_exhausted: true, unindexed_files: 3 }),
+    });
+    const notes = screen.getByTestId('needle-probe-notes');
+    expect(notes).toHaveTextContent(/A store listing failed/);
+    expect(notes).toHaveTextContent(/hit its byte budget/);
+    expect(notes).toHaveTextContent(/3 raw files in range are not signature-covered/);
+  });
+
+  it('says "nothing survived" as the definite answer it is', async () => {
+    await searchWith([]);
+    expect(screen.getByTestId('needle-empty')).toHaveTextContent(/No candidate anywhere in range/);
+    expect(screen.getByTestId('needle-empty')).toHaveTextContent(/definite "not here", not a maybe/);
+  });
+
+  it('fails loudly when a node answers without a candidate list', async () => {
+    // An empty list is the BEST answer this product can give ("the index
+    // proved the token is nowhere in range"), so a MISSING list must never be
+    // able to impersonate one.
     fetchMock.mockImplementation((url: string) => {
-      if (String(url).includes('/v1/search_tokens')) return Promise.resolve(jsonResponse({ scanned_files: 3 }));
+      if (String(url).includes('/v1/needle')) return Promise.resolve(jsonResponse({ token: 'abc' }));
       if (String(url).includes('/v1/sql/estimate')) return new Promise<Response>(() => {});
       return Promise.resolve(jsonResponse({}));
     });
@@ -858,18 +1024,55 @@ describe('U8 — the needle result is ranked, not a wall', () => {
     fireEvent.click(screen.getByRole('button', { name: /^Search/ }));
     await waitFor(() => expect(screen.getByTestId('asyncop-needle-search')).toHaveAttribute('data-phase', 'error'));
     expect(screen.queryByTestId('needle-summary')).not.toBeInTheDocument();
+    expect(screen.getByTestId('needle-search-error')).toHaveTextContent(/did not return a `candidates` array/);
+  });
+
+  it('shows the tokenizer-normalized token the node actually probed', async () => {
+    // `ORD-7741.` is indexed as `ORD-7741`. The operator must be told which
+    // question was answered, and the drill must grep for THAT.
+    fetchMock.mockImplementation((url: string) => {
+      if (String(url).includes('/v1/needle')) {
+        return Promise.resolve(
+          jsonResponse(makeNeedleBody([makeCandidate(key('2026-08-07', '14'))], { token: 'ORD-7741' }))
+        );
+      }
+      if (String(url).includes('/v1/sql/estimate')) return new Promise<Response>(() => {});
+      return Promise.resolve(jsonResponse({}));
+    });
+    renderExplore();
+    fireEvent.change(screen.getByLabelText(/^Token/), { target: { value: 'ORD-7741.' } });
+    fireEvent.change(screen.getByLabelText(/^Service/), { target: { value: 'svc-a' } });
+    fireEvent.click(screen.getByRole('button', { name: /^Search/ }));
+    await waitFor(() => expect(screen.getByTestId('needle-summary')).toBeInTheDocument());
+    expect(screen.getByText(/probed as/)).toBeInTheDocument();
+
+    fireEvent.click(screen.getAllByTestId('needle-window-row')[0]!);
+    await waitFor(() => expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('/v1/raw_grep'))).toBe(true));
+    const grep = fetchMock.mock.calls.filter((c) => String(c[0]).includes('/v1/raw_grep'));
+    expect(bodyOf(grep[0])).toMatchObject({ token: 'ORD-7741' });
+  });
+
+  it('refuses a phrase before spending a round trip on it', async () => {
+    fetchMock.mockImplementation(() => new Promise<Response>(() => {}));
+    renderExplore();
+    fireEvent.change(screen.getByLabelText(/^Token/), { target: { value: 'two words' } });
+    expect(screen.getByTestId('needle-search-btn')).toBeDisabled();
+    expect(screen.getByTestId('needle-phrase-hint')).toHaveTextContent(/a needle is one token/);
   });
 });
 
 describe('U9 — the drill answer renders under the row that asked', () => {
   it('renders the result immediately after the clicked row, not after the list', async () => {
     fetchMock.mockImplementation((url: string) => {
-      if (String(url).includes('/v1/search_tokens')) {
+      if (String(url).includes('/v1/needle')) {
         return Promise.resolve(
-          jsonResponse({
-            windows: [makeWindow('svc-a', 0), makeWindow('svc-b', 3600e9), makeWindow('svc-c', 7200e9)],
-            scanned_files: 9,
-          })
+          jsonResponse(
+            makeNeedleBody([
+              makeUncovered(key('2026-08-07', '01')),
+              makeUncovered(key('2026-08-07', '02')),
+              makeUncovered(key('2026-08-07', '03')),
+            ])
+          )
         );
       }
       if (String(url).includes('/v1/raw_grep')) {
@@ -894,6 +1097,7 @@ describe('U9 — the drill answer renders under the row that asked', () => {
     });
     renderExplore();
     fireEvent.change(screen.getByLabelText(/^Token/), { target: { value: 'abc' } });
+    fireEvent.change(screen.getByLabelText(/^Service/), { target: { value: 'svc-b' } });
     fireEvent.click(screen.getByRole('button', { name: /^Search/ }));
     await waitFor(() => expect(screen.getAllByTestId('needle-window-row')).toHaveLength(3));
 
@@ -908,12 +1112,26 @@ describe('U9 — the drill answer renders under the row that asked', () => {
     expect(rows[2]!.nextElementSibling).toBeNull();
   });
 
-  it('greps the whole collapsed run in ONE request', async () => {
-    await searchWith([makeWindow('svc', 0), makeWindow('svc', 300e9)]);
+  it('greps the whole hour in ONE request, clamped to the probed range', async () => {
+    // 2026-08-07 02:00 UTC, and the shared range is the last hour, so the
+    // clamp is what keeps the grep inside the window the answer describes.
+    const hourStart = Date.UTC(2026, 7, 7, 2);
+    setSharedTimeRange({ kind: 'absolute', startMs: hourStart, endMs: hourStart + 1_800_000 });
+    await searchWith(
+      [makeUncovered(key('2026-08-07', '02', 'a', 0)), makeUncovered(key('2026-08-07', '02', 'b', 1))],
+      {},
+      'svc'
+    );
     fireEvent.click(screen.getAllByTestId('needle-window-row')[0]!);
     await waitFor(() => expect(fetchMock.mock.calls.some((c) => String(c[0]).includes('/v1/raw_grep'))).toBe(true));
     const grep = fetchMock.mock.calls.filter((c) => String(c[0]).includes('/v1/raw_grep'));
     expect(grep).toHaveLength(1);
-    expect(bodyOf(grep[0])).toMatchObject({ service: 'svc', from_ns: 0, to_ns: 600e9 });
+    expect(bodyOf(grep[0])).toMatchObject({
+      service: 'svc',
+      from_ns: hourStart * NS_PER_MS,
+      // The hour ends at 03:00 but the probed range ended at 02:30: a click
+      // must never grep outside the range the candidate list was computed for.
+      to_ns: (hourStart + 1_800_000) * NS_PER_MS,
+    });
   });
 });

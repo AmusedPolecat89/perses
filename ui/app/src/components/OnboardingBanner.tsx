@@ -1,9 +1,17 @@
 // Copyright OBSESC Authors
 //
 // Persistent dismissible banner shown above every dashboard while
-// the node hasn't received any events yet and the operator hasn't
-// dismissed it. Hidden on /onboarding itself (they're already
-// there) and once ingest crosses zero (the data proves it worked).
+// the node holds NO DATA AT ALL and the operator hasn't dismissed
+// it. Hidden on /onboarding itself (they're already there) and as
+// soon as the node can show that events landed (the data proves it
+// worked).
+//
+// "Holds no data" is `useOnboarded`'s job and it is a claim about
+// storage, not about traffic: this banner once told a cluster with
+// 9.17 TB stored and 11.6 TB committed that there was "no ingest
+// yet", because the predicate underneath it read a counter that
+// resets when the process does. An empty state that can appear over
+// a full cluster is worse than no empty state.
 
 import { ReactElement } from 'react';
 import { Box, Button, IconButton, Stack, Typography } from '@mui/material';

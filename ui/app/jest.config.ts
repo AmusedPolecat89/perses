@@ -13,5 +13,18 @@
 
 import shared from '../jest.shared';
 
-// Just use shared config as-is for now
-export default shared;
+export default {
+  ...shared,
+  moduleNameMapper: {
+    // OBSESC fork: this ui/ workspace ships `app`, `core` and
+    // `internal-utils` only — the rest of @perses-dev/* is consumed from
+    // node_modules as published packages. The shared config maps every
+    // @perses-dev/* import onto a sibling SOURCE folder that therefore does
+    // not exist here, so any test whose component tree touches one (e.g.
+    // `useLocalStorage` from @perses-dev/components, which the onboarding
+    // banner reads) failed to resolve rather than failing to pass. This entry
+    // is FIRST because jest applies moduleNameMapper in insertion order.
+    '^@perses-dev/(components|dashboards|explore|plugin-system)$': '<rootDir>/../node_modules/@perses-dev/$1',
+    ...shared.moduleNameMapper,
+  },
+};

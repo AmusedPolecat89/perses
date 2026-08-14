@@ -31,9 +31,16 @@ export function useOnboarded(): OnboardedState {
   );
   const { data: stats } = useNodeStats(15_000);
 
-  // Auto-complete the moment first ingest lands — operator shouldn't
-  // need to click "I'm done" if the data itself proves they are.
-  const ingestSeen = (stats?.totalIngestBytesCumulative ?? 0) > 0;
+  // Auto-complete the moment there IS data — operator shouldn't need to
+  // click "I'm done" if the data itself proves they are.
+  //
+  // `hasEverIngested`, not `totalIngestBytesCumulative > 0`. The latter is
+  // the received counter, which resets on restart, so a cluster holding
+  // 9.17 TB was shown "No ingest yet. Send your first event." on every
+  // dashboard — during exactly the paused, query-focused walkthrough a demo
+  // is. The empty state must key on whether data EXISTS, never on whether
+  // bytes are arriving right now.
+  const ingestSeen = stats?.hasEverIngested ?? false;
   const isComplete = storedComplete || ingestSeen;
 
   // Dev/demo override: setting localStorage.PERSES_OBSESC_FORCE_BANNER

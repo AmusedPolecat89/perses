@@ -47,12 +47,16 @@ export function CurlSendStep(): ReactElement {
   const [copied, setCopied] = useState(false);
 
   const { data: stats } = useNodeStats(3_000);
-  const ingestSeen = (stats?.totalIngestBytesCumulative ?? 0) > 0;
+  // Same signal as the banner, and for the same reason: the received counter
+  // resets on restart, so "Waiting for first event…" stood beside 11.6 TB
+  // committed on the demo cluster. Data presence, not arrival rate.
+  const ingestSeen = stats?.hasEverIngested ?? false;
 
-  // Remember the cumulative bytes at the moment this step mounted
-  // so we can show "✓ first event received" even after a refresh
-  // — looking at total>0 alone would always be true after the
-  // first onboarding.
+  // Remember the RECEIVED bytes at the moment this step mounted so we can
+  // show "✓ first event received" even after a refresh — looking at total>0
+  // alone would always be true after the first onboarding. This one is
+  // correctly the volatile counter: it moves the instant a request is seen
+  // at the handler boundary, which is what "did my curl land?" asks.
   const [baseline, setBaseline] = useState<number | null>(null);
   useEffect(() => {
     if (baseline === null && stats?.totalIngestBytesCumulative !== undefined) {

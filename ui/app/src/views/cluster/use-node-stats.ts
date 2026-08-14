@@ -20,7 +20,26 @@ export interface NodeStats {
   // from_raw driver lag: committed raw files not yet summarised.
   summaryBacklogFiles: number;
   // Received (pre-admission) cumulative bytes across all sources.
+  // VOLATILE: `obsesc_ingest_bytes_total` is the observability counter and
+  // the meter's own docs say it resets on restart. Do not ask it whether a
+  // node has data — ask it how much it has taken in since it started.
   totalIngestBytesCumulative: number;
+  // Has this node EVER ingested? Not "is it ingesting now".
+  //
+  // This is the predicate the onboarding banner and the onboarding view read,
+  // and it exists because they used to read `totalIngestBytesCumulative > 0`
+  // instead. On the 9.17 TB demo cluster that counter was zero — the node had
+  // been restarted since the load, and the counter does not survive a restart
+  // — so a cluster holding 11.6 TB committed was told "No ingest yet. Send
+  // your first event", on every dashboard, during the paused query-focused
+  // walkthrough that a customer demo is.
+  //
+  // So the durable evidence comes first: the WAL checkpoint position is
+  // persisted and monotonic, which makes committed bytes a fact about the
+  // DATA rather than about this process's uptime. The volatile counter and
+  // the raw checkpoint segments are kept as fallbacks — any one of them
+  // non-zero is proof that events landed here.
+  hasEverIngested: boolean;
   // Per-source instantaneous cumulative bytes.
   bytesBySource: Record<string, number>;
   // Memory budget snapshots — subsystem → { current, limit, pct }.
@@ -46,7 +65,8 @@ export interface NodeStats {
 const METRICS_URL = '/obsesc-api/metrics';
 const HEALTH_URL = '/obsesc-api/v1/health';
 
-function parsePrometheus(text: string): NodeStats {
+/** Exported for the regression test that pins the "has data" predicate. */
+export function parsePrometheus(text: string): NodeStats {
   const lines = text.split('\n');
   const stats: NodeStats = {
     healthy: true,
@@ -54,6 +74,7 @@ function parsePrometheus(text: string): NodeStats {
     committedMBps: null,
     summaryBacklogFiles: 0,
     totalIngestBytesCumulative: 0,
+    hasEverIngested: false,
     bytesBySource: {},
     budgets: {},
     walShards: [],
@@ -145,6 +166,13 @@ function parsePrometheus(text: string): NodeStats {
   }
 
   stats.walShards.sort((a, b) => a.shard.localeCompare(b.shard));
+
+  // Presence of DATA, never a rate and never a since-boot counter alone. Any
+  // one of these being non-zero is proof that events landed on this node.
+  stats.hasEverIngested =
+    stats.committedBytesCumulative > 0 ||
+    stats.totalIngestBytesCumulative > 0 ||
+    stats.walShards.some((s) => s.segment > 0 || s.offset > 0);
   return stats;
 }
 

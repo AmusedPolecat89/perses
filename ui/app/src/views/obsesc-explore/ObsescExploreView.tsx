@@ -11,8 +11,18 @@
 //      100%, query it like a table; the index is an accelerator, not a
 //      gatekeeper."
 //
-//   2. Needle search: token → bloom-pruned (service, window) candidates →
-//      click through to the verbatim raw event straight off Parquet.
+//   2. Needle search: token → `POST /v1/needle` → the bounded survivor set
+//      (raw files, and the rowgroups inside them, that may hold the token)
+//      → click through to the verbatim raw event straight off Parquet.
+//
+//      It used to call `GET /v1/search_tokens`. That endpoint is not slow,
+//      it is UNBOUNDED: it walks the summary tier from the root and fully
+//      decodes every `.obsc` file it finds — 363,012 on one node of the 9 TB
+//      cluster — whatever time range you asked for, so its cost tracks the
+//      size of the estate rather than the size of the question. It never
+//      returned in 45 s and never would have. `/v1/needle` answers the same
+//      question from the bit-sliced needle index in bounded ranged reads and
+//      came back in 0 s on the same cluster, the same token.
 //
 // Fetches go straight to /obsesc-api (same pattern as use-node-stats):
 // this surface must work on a fresh node before any datasource exists.
@@ -22,22 +32,26 @@ import { Alert, Box, Button, Chip, Stack, TextField, Tooltip, Typography } from 
 import ChevronRight from 'mdi-material-ui/ChevronRight';
 import ChevronDown from 'mdi-material-ui/ChevronDown';
 import { AsyncOpBar, AsyncOpStatus, asyncOpTriggerProps } from '../../components/progress/AsyncOp';
-import { useAsyncOp } from '../../components/progress/useAsyncOp';
+import { AsyncOpState, useAsyncOp } from '../../components/progress/useAsyncOp';
+import { OpErrorAlert } from '../../components/OpErrorAlert';
 import { eitherSignal } from '../../utils/either-signal';
 import { TimeRangeControl } from '../../components/TimeRangeControl';
 import { useSharedTimeRange } from '../../hooks/use-shared-time-range';
 import { ResolvedRange, isoSeconds, rangeKey, rangeLabel, resolveRange } from '../../model/time-range';
 import {
-  NeedleGroup,
-  NeedleRun,
-  NeedleSignal,
-  SIGNAL_EXPLAIN,
-  SIGNAL_LABEL,
-  TokenWindow,
-  groupNeedleWindows,
-  signalTally,
+  CandidateDay,
+  CandidateHour,
+  CandidateTotals,
+  CandidateVerdict,
+  NeedleCandidate,
+  NeedleStats,
+  VERDICT_EXPLAIN,
+  VERDICT_LABEL,
+  candidateTotals,
+  groupCandidates,
+  provablyExcludedFiles,
   startHere,
-} from './needle-ranking';
+} from './needle-candidates';
 
 const API = '/obsesc-api';
 const FETCH_TIMEOUT_MS = 60_000;
@@ -153,17 +167,6 @@ interface ScanGateResponse {
   estimate: ScanPreview;
   /** Server-composed and guaranteed money-free. Rendered verbatim. */
   message: string;
-}
-
-/** Probe transparency from the bit-sliced needle index (`NeedleStats`). */
-interface NeedleStats {
-  slabs_probed: number;
-  manifests_probed: number;
-  probe_bytes: number;
-  covered_files: number;
-  unindexed_files: number;
-  listing_failed: boolean;
-  manifest_budget_exhausted?: boolean;
 }
 
 interface RawEventJson {
@@ -772,16 +775,11 @@ function SqlSection(): ReactElement {
           Scan gate: {gate.message}
         </Alert>
       )}
-      {estimate.state.error !== null && (
-        <Alert severity="error" sx={{ mt: 1.5, ...mono, fontSize: 12 }}>
-          {estimate.state.error}
-        </Alert>
-      )}
-      {query.state.error !== null && (
-        <Alert severity="error" sx={{ mt: 1.5, ...mono, fontSize: 12 }}>
-          {query.state.error}
-        </Alert>
-      )}
+      {/* Never the raw throw: a JavaScript class name is not a fault an
+          operator can act on. The elapsed line above still says "✗ failed
+          after 0.1s" — that part was always good. */}
+      <OpErrorAlert error={estimate.state.error} what="estimate" testId="sql-estimate-error" />
+      <OpErrorAlert error={query.state.error} what="query" testId="sql-run-error" />
 
       {rows && (
         // A re-run dims the previous table rather than blanking it for
@@ -846,62 +844,58 @@ function highlightToken(body: string, token: string): ReactNode {
   return out;
 }
 
-/** What one search resolved to — the token snapshot travels WITH the result. */
+/** What one probe resolved to — the token snapshot travels WITH the result. */
 interface NeedleSearchResult {
-  windows: TokenWindow[];
-  /** Matching windows before any server-side truncation. */
-  total: number;
-  scanned: number;
-  /** Windows the needle index removed as PROVABLY token-free. */
-  prunedWindows: number;
-  /** `null` = no needle assist ran; the ranking falls back to the blooms. */
+  candidates: NeedleCandidate[];
+  totals: CandidateTotals;
+  /** `null` = the node answered without probe stats; nothing is inferred. */
   stats: NeedleStats | null;
-  /** The token this window list was searched with — the drill greps for
-   *  exactly this, so editing the input afterwards can't grep a different
-   *  token, and a superseded search can't leave its token behind. */
-  searchedToken: string;
+  /** The ceiling for scanning the survivors, straight off the wire. */
+  scanEstimate: ScanPreview | null;
+  /** The node's own honesty note about what "candidate" and "absent" mean. */
+  note: string | null;
+  /** The TOKENIZER-NORMALIZED token the node actually probed — edge
+   *  punctuation trimmed. The drill greps for exactly this, so editing the
+   *  input afterwards can't grep a different token, and it is also what the
+   *  operator needs to see: `"ORD-7741."` was probed as `ORD-7741`. */
+  probedToken: string;
+  /** The range the probe covered. The drill clamps every window to it, so a
+   *  click can never grep outside the range the answer was computed for. */
+  fromNs: number;
+  toNs: number;
 }
 
-/** Runs rendered per service before the group says "narrow it". */
-const RUNS_PER_GROUP = 25;
-
 /**
- * Expand everything only while everything still FITS. Past that the top
- * group is expanded and the rest stand as one-line summaries — which is the
- * difference between 4,056 rows and a page you can read.
+ * Expand everything only while everything still FITS. Past that the top group
+ * is expanded and the rest stand as one-line summaries — a retention-wide IOC
+ * sweep can legitimately return ninety days of them.
  */
-function expandsByDefault(groups: NeedleGroup[]): (index: number) => boolean {
-  const totalRuns = groups.reduce((n, g) => n + g.runs.length, 0);
-  const all = groups.length <= 5 && totalRuns <= RUNS_PER_GROUP;
+function expandsByDefault(groups: CandidateDay[]): (index: number) => boolean {
+  const totalHours = groups.reduce((n, g) => n + g.hours.length, 0);
+  const all = groups.length <= 5 && totalHours <= 25;
   return (index: number) => all || index === 0;
 }
 
-function signalChipColor(signal: NeedleSignal): 'success' | 'primary' | 'warning' | 'default' {
-  if (signal === 'corroborated') return 'success';
-  if (signal === 'bloom-hit') return 'primary';
-  if (signal === 'saturated') return 'warning';
-  return 'default';
-}
-
-function SignalChip({ signal }: { signal: NeedleSignal }): ReactElement {
+function VerdictChip({ verdict }: { verdict: CandidateVerdict }): ReactElement {
   return (
-    <Tooltip title={SIGNAL_EXPLAIN[signal]}>
+    <Tooltip title={VERDICT_EXPLAIN[verdict]}>
       <Chip
         size="small"
         variant="outlined"
-        color={signalChipColor(signal)}
-        label={SIGNAL_LABEL[signal]}
-        data-testid="needle-signal-chip"
+        color={verdict === 'signature-flagged' ? 'success' : 'default'}
+        label={VERDICT_LABEL[verdict]}
+        data-testid="needle-verdict-chip"
       />
     </Tooltip>
   );
 }
 
-/** `10:00:00 → 14:00:00` when the run stays inside one day; full stamps otherwise. */
-function runSpan(run: NeedleRun): string {
-  const from = tsPretty(run.startNs);
-  const to = tsPretty(run.endNs);
-  return from.slice(0, 10) === to.slice(0, 10) ? `${from} → ${to.slice(11)}` : `${from} → ${to}`;
+/** `14:00 → 15:00 UTC`, or the honest "no hour partition in the key". */
+function hourSpan(hour: CandidateHour): string {
+  if (hour.startMs === null || hour.endMs === null) return 'no hour partition in the key';
+  const from = new Date(hour.startMs).toISOString();
+  const to = new Date(hour.endMs).toISOString();
+  return `${from.slice(11, 16)} → ${to.slice(11, 16)} UTC`;
 }
 
 /**
@@ -914,18 +908,14 @@ function DrillResult({
   grep,
   token,
 }: {
-  state: ReturnType<typeof useAsyncOp<RawGrepResponse, [NeedleRun, string]>>['state'];
+  state: AsyncOpState<RawGrepResponse>;
   grep: RawGrepResponse | null;
   token: string;
 }): ReactElement {
   return (
     <Box sx={{ pl: 2, pb: 1.5, borderLeft: '2px solid', borderColor: 'primary.main' }} data-testid="needle-drill-panel">
       <AsyncOpBar state={state} />
-      {state.error !== null && (
-        <Alert severity="error" sx={{ mt: 1, ...mono, fontSize: 12 }}>
-          {state.error}
-        </Alert>
-      )}
+      <OpErrorAlert error={state.error} what="grep" testId="needle-drill-error" />
       {grep && (grep.owners_failed ?? 0) > 0 && (
         <Alert severity="warning" sx={{ mt: 1 }}>
           {grep.owners_failed} owner node{grep.owners_failed === 1 ? '' : 's'} failed to answer — coverage is partial;
@@ -984,18 +974,26 @@ function DrillResult({
  */
 function NeedleProbeNotes({ result }: { result: NeedleSearchResult }): ReactElement | null {
   const notes: string[] = [];
-  if (result.prunedWindows > 0) {
+  const excluded = provablyExcludedFiles(result.stats, result.totals);
+  if (excluded > 0) {
     notes.push(
-      `${result.prunedWindows.toLocaleString()} window${
-        result.prunedWindows === 1 ? '' : 's'
-      } removed by the needle index as provably token-free — they are not hidden, they are excluded.`
+      `${excluded.toLocaleString()} raw file${
+        excluded === 1 ? '' : 's'
+      } in range are covered by signatures and absent from this list, which means they PROVABLY do not contain the token — they are not hidden, they are excluded.`
     );
   }
   if (result.stats === null) {
     notes.push(
-      'No needle-index assist ran for this search (no raw tier/catalog, or the token is below the indexing floor), so ranking rests on the token blooms alone.'
+      'This node returned no probe stats, so nothing here can be said about coverage — the candidate list is all there is.'
     );
   } else {
+    notes.push(
+      `Probe read ${formatBytes(result.stats.probe_bytes)} to answer this: ${result.stats.slabs_probed.toLocaleString()} day slab${
+        result.stats.slabs_probed === 1 ? '' : 's'
+      } and ${result.stats.manifests_probed.toLocaleString()} hourly manifest${
+        result.stats.manifests_probed === 1 ? '' : 's'
+      }, in ranged reads. That cost is bounded by the index, not by the estate.`
+    );
     if (result.stats.listing_failed) {
       notes.push(
         'A store listing failed, so part of the range degraded to "not covered" — over-keep, never a false negative.'
@@ -1010,7 +1008,7 @@ function NeedleProbeNotes({ result }: { result: NeedleSearchResult }): ReactElem
       notes.push(
         `${result.stats.unindexed_files.toLocaleString()} raw file${
           result.stats.unindexed_files === 1 ? '' : 's'
-        } in range are not signature-covered (fresh or never compacted) — the index cannot corroborate those windows either way.`
+        } in range are not signature-covered (fresh or never compacted) — the index cannot corroborate those either way, so they are kept whole.`
       );
     }
   }
@@ -1032,74 +1030,84 @@ function NeedleSection(): ReactElement {
   // U11: no private Range dropdown here any more — the needle searches the
   // SAME window the SQL box, the dashboards and Investigate are looking at.
   const { range } = useSharedTimeRange();
-  /** The run a drill is running against — for the per-row busy state. */
-  const [drillTarget, setDrillTarget] = useState<NeedleRun | null>(null);
-  /** Per-service expand overrides; `undefined` = whatever the default says. */
+  /** The hour a drill is running against — for the per-row busy state. */
+  const [drillTarget, setDrillTarget] = useState<CandidateHour | null>(null);
+  /** Per-day expand overrides; `undefined` = whatever the default says. */
   const [expandOverride, setExpandOverride] = useState<Record<string, boolean>>({});
 
   // The hook's generation guard closes the stale-response race this search
   // used to have: two searches in flight resolved in ARRIVAL order, so a
   // slower older search overwrote the newer results.
-  const search = useAsyncOp<NeedleSearchResult, [string, string, number, number]>(
-    async (ctx, tok, svc, fromNs, toNs) => {
-      const qs = new URLSearchParams({
-        token: tok,
-        from_ns: String(fromNs),
-        to_ns: String(toNs),
-      });
-      if (svc) qs.set('service', svc);
-      const r = await apiFetch(`/v1/search_tokens?${qs}`, undefined, ctx.signal);
+  const search = useAsyncOp<NeedleSearchResult, [string, number, number]>(
+    async (ctx, tok, fromNs, toNs) => {
+      // POST, not GET, and `/v1/needle`, not `/v1/search_tokens`. There is no
+      // `service` on this wire: the needle index is service-blind by
+      // construction, because a cross-estate IOC sweep has no service to
+      // route by.
+      const r = await apiFetch(
+        '/v1/needle',
+        {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ token: tok, from_ns: fromNs, to_ns: toNs }),
+        },
+        ctx.signal
+      );
       if (!r.ok) throw new Error(`${r.status}: ${await r.text()}`);
       const d = (await r.json()) as {
-        windows?: TokenWindow[];
-        total?: number;
-        scanned_files?: number;
-        needle_pruned_windows?: number;
-        needle?: NeedleStats | null;
+        token?: string;
+        candidates?: NeedleCandidate[];
+        stats?: NeedleStats | null;
+        scan_estimate?: ScanPreview | null;
+        note?: string;
       };
-      if (!Array.isArray(d.windows)) {
-        // Loud schema drift, same rule as the SQL envelope: an empty list is
-        // a real and meaningful answer ("the blooms pruned everything"), so
-        // a missing list must never be able to impersonate one.
-        throw new Error('GET /v1/search_tokens did not return a `windows` array — this node is not one this UI knows.');
+      if (!Array.isArray(d.candidates)) {
+        // Loud schema drift, same rule as the SQL envelope: an EMPTY list is
+        // the best answer this product can give ("the index proved the token
+        // is nowhere in range"), so a MISSING list must never be able to
+        // impersonate one.
+        throw new Error('POST /v1/needle did not return a `candidates` array — this node is not one this UI knows.');
       }
-      const windows = d.windows;
+      const candidates = d.candidates;
+      const totals = candidateTotals(candidates);
+      const stats = d.stats ?? null;
+      const excluded = provablyExcludedFiles(stats, totals);
       return {
         data: {
-          windows,
-          total: typeof d.total === 'number' ? d.total : windows.length,
-          scanned: d.scanned_files ?? 0,
-          prunedWindows: d.needle_pruned_windows ?? 0,
-          stats: d.needle ?? null,
-          searchedToken: tok,
+          candidates,
+          totals,
+          stats,
+          scanEstimate: d.scan_estimate ?? null,
+          note: typeof d.note === 'string' ? d.note : null,
+          // The node answers with the token it ACTUALLY probed, after the
+          // tokenizer trim. Grepping for anything else would be greping for
+          // a different question than the one that was answered.
+          probedToken: typeof d.token === 'string' && d.token !== '' ? d.token : tok,
+          fromNs,
+          toNs,
         },
-        receipt: `${windows.length} candidate window${windows.length === 1 ? '' : 's'} · ${
-          d.scanned_files ?? 0
-        } summary files consulted`,
+        receipt: `${totals.files.toLocaleString()} candidate file${
+          totals.files === 1 ? '' : 's'
+        } · ${excluded.toLocaleString()} proven token-free · up to ${formatBytes(totals.bytes)} to scan`,
       };
     },
     { label: 'Search', timeoutMs: FETCH_TIMEOUT_MS }
   );
 
   // The drill used to have NO feedback at all for ~10 s of raw-tier grep.
-  // It now greps a whole COLLAPSED RUN in one request: a run is contiguous
-  // and single-service by construction, so [start, end) is one window as far
-  // as /v1/raw_grep is concerned — 48 rows became one row and 48 potential
-  // requests became one.
-  const drill = useAsyncOp<RawGrepResponse, [NeedleRun, string]>(
-    async (ctx, run, tok) => {
+  // It greps a whole HOUR PARTITION in one request, clamped to the range the
+  // probe answered for, so a click can never grep outside the window the
+  // candidate list describes.
+  const drill = useAsyncOp<RawGrepResponse, [CandidateHour, string, string, number, number]>(
+    async (ctx, hour, svc, tok, fromNs, toNs) => {
+      const from = Math.max(fromNs, hour.startMs === null ? fromNs : hour.startMs * 1e6);
+      const to = Math.min(toNs, hour.endMs === null ? toNs : hour.endMs * 1e6);
       const r = await apiFetch(
         '/v1/raw_grep',
         {
           method: 'POST',
           headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({
-            service: run.service,
-            from_ns: run.startNs,
-            to_ns: run.endNs,
-            token: tok,
-            limit: 5,
-          }),
+          body: JSON.stringify({ service: svc, from_ns: from, to_ns: to, token: tok, limit: 5 }),
         },
         ctx.signal
       );
@@ -1116,18 +1124,18 @@ function NeedleSection(): ReactElement {
   );
 
   const result = search.state.data;
-  const windows = result?.windows ?? null;
-  const searchedToken = result?.searchedToken ?? '';
+  const candidates = result?.candidates ?? null;
+  const probedToken = result?.probedToken ?? '';
   const grep = drill.state.data;
   const drilling = drill.state.phase === 'running';
 
-  // Ranked, collapsed and grouped ONCE per result — the runs must keep their
-  // identity across renders or `drillTarget === run` (the per-row busy state
-  // and the inline result) would break on every keystroke.
-  const groups = useMemo(() => groupNeedleWindows(windows ?? []), [windows]);
-  const tally = useMemo(() => signalTally(windows ?? []), [windows]);
+  // Grouped ONCE per result — the hours must keep their identity across
+  // renders or `drillTarget === hour` (the per-row busy state and the inline
+  // result) would break on every keystroke in the service box.
+  const groups = useMemo(() => groupCandidates(candidates ?? []), [candidates]);
   const isDefaultExpanded = useMemo(() => expandsByDefault(groups), [groups]);
   const guidance = useMemo(() => startHere(groups), [groups]);
+  const excluded = result === undefined || result === null ? 0 : provablyExcludedFiles(result.stats, result.totals);
 
   // A new result set is a new page: previous expand choices described a
   // different list and must not survive into this one.
@@ -1136,19 +1144,30 @@ function NeedleSection(): ReactElement {
     setDrillTarget(null);
   }, [result]);
 
-  const onDrill = (run: NeedleRun): void => {
+  const onDrill = (hour: CandidateHour): void => {
+    // The verbatim grep is service-pinned at the raw reader (an exact string
+    // match on the `service` column), and the needle index does not record
+    // which service a file's rows belong to. So the drill is offered only
+    // once the operator has named one — an affordance that cannot answer is
+    // worse than one that is honestly absent.
+    if (service === '' || result === null || result === undefined) return;
     // Re-entry on the SAME row is a no-op; a different row supersedes.
-    if (drilling && drillTarget === run) return;
-    setDrillTarget(run);
-    drill.run(run, searchedToken);
+    if (drilling && drillTarget === hour) return;
+    setDrillTarget(hour);
+    drill.run(hour, service, probedToken, result.fromNs, result.toNs);
   };
 
   const runSearch = (): void => {
     const r = resolveRange(range, Date.now());
-    search.run(token, service, r.fromNs, r.toNs);
+    search.run(token, r.fromNs, r.toNs);
   };
 
-  const tokenTooShort = token.length < 3;
+  const tokenTooShort = token.trim().length < 3;
+  // A needle is ONE token. The node rejects whitespace with a 400 rather than
+  // guessing at a phrase, so the precondition is stated here instead of spent
+  // on a round trip.
+  const tokenIsPhrase = /\s/.test(token.trim());
+  const blocked = tokenTooShort || tokenIsPhrase;
   const regionBar = drilling ? drill.state : search.state;
 
   return (
@@ -1158,9 +1177,11 @@ function NeedleSection(): ReactElement {
         Needle search
       </Typography>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 1.5 }}>
-        Grep months of raw logs for one token (a request id, an IP, an error string). Token blooms prune to the
-        candidate windows and the bit-sliced needle index corroborates them; the drill-down greps the window and shows
-        only verbatim matches — a bloom false positive says so instead of showing an unrelated event.
+        Has this token (a request id, an IP, a file hash) appeared <em>anywhere</em> in the estate in this range? The
+        bit-sliced needle index answers from ranged reads of its own signatures — bounded by the index, not by how much
+        you have stored — and it answers in both directions: the files it lists may hold the token, and the covered
+        files it does <strong>not</strong> list provably do not. Name a service to grep a candidate hour for verbatim
+        matches.
       </Typography>
       <Stack direction="row" gap={1.5} alignItems="center" flexWrap="wrap">
         <TextField
@@ -1173,11 +1194,12 @@ function NeedleSection(): ReactElement {
         />
         <TextField
           size="small"
-          label="Service (optional)"
+          label="Service (to grep)"
           value={service}
           onChange={(e) => setService(e.target.value)}
           sx={{ minWidth: 180 }}
           slotProps={{ input: { sx: mono } }}
+          helperText="not part of the probe"
         />
         {/* Blocked only by a PRECONDITION, never by in-flight work — and the
             reason is rendered next to it instead of left mute. data-testid for
@@ -1186,7 +1208,7 @@ function NeedleSection(): ReactElement {
           variant="contained"
           data-testid="needle-search-btn"
           onClick={runSearch}
-          disabled={tokenTooShort}
+          disabled={blocked}
           {...asyncOpTriggerProps(search.state)}
         >
           {search.state.phase === 'running' ? 'Searching…' : 'Search'}
@@ -1194,6 +1216,11 @@ function NeedleSection(): ReactElement {
         {tokenTooShort && (
           <Typography variant="caption" color="text.secondary">
             enter at least 3 characters to search
+          </Typography>
+        )}
+        {!tokenTooShort && tokenIsPhrase && (
+          <Typography variant="caption" color="text.secondary" data-testid="needle-phrase-hint">
+            a needle is one token — the index stores whitespace-split tokens, so a phrase has nothing to probe
           </Typography>
         )}
         <Typography variant="caption" color="text.secondary">
@@ -1205,7 +1232,7 @@ function NeedleSection(): ReactElement {
           id="needle-search"
           state={search.state}
           label="Search"
-          runningHint="Probing token blooms across the summary tier…"
+          runningHint="Probing the needle index — ranged reads over day slabs and hourly manifests…"
           onCancel={search.cancel}
         />
         <AsyncOpStatus
@@ -1214,45 +1241,61 @@ function NeedleSection(): ReactElement {
           label="Grep"
           runningHint={
             drillTarget
-              ? `Greping ${drillTarget.windows.toLocaleString()} window${
-                  drillTarget.windows === 1 ? '' : 's'
-                } · ${drillTarget.eventCount.toLocaleString()} events…`
-              : 'Greping the window…'
+              ? `Greping ${drillTarget.files.toLocaleString()} candidate file${
+                  drillTarget.files === 1 ? '' : 's'
+                } in ${hourSpan(drillTarget)}…`
+              : 'Greping the hour…'
           }
           onCancel={drill.cancel}
         />
       </Stack>
 
-      {search.state.error !== null && (
-        <Alert severity="error" sx={{ mt: 1.5, ...mono, fontSize: 12 }}>
-          {search.state.error}
-        </Alert>
-      )}
+      <OpErrorAlert error={search.state.error} what="needle search" testId="needle-search-error" />
 
       {result && (
         <Box sx={{ mt: 2, opacity: search.state.phase === 'running' ? 0.45 : 1 }}>
-          {/* The headline: what the search found, said in the units that
-              actually differ between rows. The old line said "N candidate
-              windows" and nothing else, which is why 4,056 identical rows
-              read as failure rather than as one saturated bloom. */}
+          {/* The headline says BOTH halves of the answer. The candidate count
+              alone is the weaker half — what makes this index worth having is
+              the number of files it ruled out, which is an exact absence and
+              is stated as one. */}
           <Typography variant="body2" color="text.secondary" data-testid="needle-summary">
-            {result.total.toLocaleString()} candidate window{result.total === 1 ? '' : 's'} across{' '}
-            {groups.length.toLocaleString()} service{groups.length === 1 ? '' : 's'} · {result.scanned.toLocaleString()}{' '}
-            summary files consulted
+            {result.totals.files.toLocaleString()} candidate file{result.totals.files === 1 ? '' : 's'} across{' '}
+            {groups.length.toLocaleString()} day{groups.length === 1 ? '' : 's'} · {excluded.toLocaleString()} file
+            {excluded === 1 ? '' : 's'} proven token-free · up to {formatBytes(result.totals.bytes)} to scan
           </Typography>
+          {result.probedToken !== '' && result.probedToken !== token && (
+            <Typography variant="caption" color="text.secondary" sx={{ display: 'block', mt: 0.5 }}>
+              probed as <code>{result.probedToken}</code> — the index stores tokens with edge punctuation trimmed, and
+              this is the form it was asked about
+            </Typography>
+          )}
           <Stack direction="row" gap={1} flexWrap="wrap" sx={{ mt: 0.75 }}>
-            {(['corroborated', 'bloom-hit', 'no-bloom', 'saturated'] as NeedleSignal[])
-              .filter((s) => tally[s] > 0)
-              .map((s) => (
-                <Tooltip key={s} title={SIGNAL_EXPLAIN[s]}>
+            {(['signature-flagged', 'not-covered'] as CandidateVerdict[])
+              .filter(
+                (v) => (v === 'signature-flagged' ? result.totals.indexedFiles : result.totals.uncoveredFiles) > 0
+              )
+              .map((v) => (
+                <Tooltip key={v} title={VERDICT_EXPLAIN[v]}>
                   <Chip
                     size="small"
                     variant="outlined"
-                    color={signalChipColor(s)}
-                    label={`${tally[s].toLocaleString()} ${SIGNAL_LABEL[s]}`}
+                    color={v === 'signature-flagged' ? 'success' : 'default'}
+                    label={`${(v === 'signature-flagged'
+                      ? result.totals.indexedFiles
+                      : result.totals.uncoveredFiles
+                    ).toLocaleString()} ${VERDICT_LABEL[v]}`}
                   />
                 </Tooltip>
               ))}
+            {result.totals.rowgroups > 0 && (
+              <Chip
+                size="small"
+                variant="outlined"
+                label={`${result.totals.rowgroups.toLocaleString()} candidate rowgroup${
+                  result.totals.rowgroups === 1 ? '' : 's'
+                }`}
+              />
+            )}
           </Stack>
           {guidance !== null && (
             <Alert severity="info" sx={{ mt: 1.5 }} data-testid="needle-start-here">
@@ -1260,92 +1303,124 @@ function NeedleSection(): ReactElement {
             </Alert>
           )}
           <NeedleProbeNotes result={result} />
+          {/* The node composes its own honesty note about what "candidate"
+              and "provably absent" mean under its tokenizer contract. It is
+              rendered verbatim for the same reason the scan honesty note is:
+              re-wording a guarantee is how a guarantee stops being one. */}
+          {result.note !== null && (
+            <Typography
+              variant="caption"
+              color="text.secondary"
+              sx={{ display: 'block', mt: 0.75 }}
+              data-testid="needle-honesty"
+            >
+              {result.note}
+            </Typography>
+          )}
+          {/* The probe is bounded; the SCAN of the survivors is not, and the
+              node hands back the ceiling for exactly that follow-up. Same
+              component the SQL box uses, because it is the same wire type. */}
+          {result.scanEstimate !== null && result.totals.files > 0 && (
+            <Box sx={{ mt: 1.5 }}>
+              <Typography variant="caption" color="text.secondary" sx={{ display: 'block' }}>
+                Scanning every survivor through <code>POST /v1/sql</code> with{' '}
+                <code>obsesc_token(body, &apos;{result.probedToken}&apos;)</code> would read at most:
+              </Typography>
+              <ScanCeiling preview={result.scanEstimate} />
+            </Box>
+          )}
 
           {groups.length === 0 ? (
-            <Typography variant="body2" color="text.secondary" sx={{ mt: 1.5 }}>
-              No window survived the blooms in this range — for a window that carries a bloom, that is a definite
-              &quot;not here&quot;, not a maybe.
+            <Typography variant="body2" color="text.secondary" sx={{ mt: 1.5 }} data-testid="needle-empty">
+              No candidate anywhere in range. Every file the signatures cover is a proven absence — for those files this
+              is a definite &quot;not here&quot;, not a maybe.
             </Typography>
           ) : (
             <Box sx={{ mt: 1.5 }}>
+              {service === '' && (
+                <Typography
+                  variant="caption"
+                  color="text.secondary"
+                  sx={{ display: 'block', pb: 1 }}
+                  data-testid="needle-drill-hint"
+                >
+                  Name a service above to make every row below a one-click verbatim grep. The needle index does not
+                  record which service a raw file&apos;s rows belong to — that is what makes an estate-wide sweep
+                  possible — and the raw grep matches the service exactly, so it cannot be guessed here.
+                </Typography>
+              )}
               {groups.map((group, gi) => {
-                const open = expandOverride[group.service] ?? isDefaultExpanded(gi);
+                const key = group.day ?? 'undated';
+                const open = expandOverride[key] ?? isDefaultExpanded(gi);
                 return (
-                  <Box
-                    key={group.service}
-                    sx={{ borderTop: '1px solid rgba(128,128,128,0.15)' }}
-                    data-testid="needle-group"
-                  >
+                  <Box key={key} sx={{ borderTop: '1px solid rgba(128,128,128,0.15)' }} data-testid="needle-group">
                     <Stack
                       direction="row"
                       gap={1}
                       alignItems="center"
                       flexWrap="wrap"
                       sx={{ py: 0.75, cursor: 'pointer' }}
-                      onClick={() => setExpandOverride((prev) => ({ ...prev, [group.service]: !open }))}
+                      onClick={() => setExpandOverride((prev) => ({ ...prev, [key]: !open }))}
                       role="button"
                       aria-expanded={open}
                       data-testid="needle-group-header"
                     >
                       {open ? <ChevronDown fontSize="small" /> : <ChevronRight fontSize="small" />}
                       <Typography variant="body2" sx={{ ...mono, fontWeight: 600 }}>
-                        {group.service}
+                        {group.day ?? 'keys with no hour partition'}
                       </Typography>
-                      <SignalChip signal={group.best} />
+                      <VerdictChip verdict={group.best} />
                       <Typography variant="caption" color="text.secondary">
-                        {group.runs.length.toLocaleString()} run{group.runs.length === 1 ? '' : 's'} ·{' '}
-                        {group.windowCount.toLocaleString()} window{group.windowCount === 1 ? '' : 's'} ·{' '}
-                        {group.eventCount.toLocaleString()} events
+                        {group.hours.length.toLocaleString()} hour{group.hours.length === 1 ? '' : 's'} ·{' '}
+                        {group.files.toLocaleString()} file{group.files === 1 ? '' : 's'} · {formatBytes(group.bytes)}{' '}
+                        to scan
                       </Typography>
-                      {/* The move the operator made by hand on the live
-                          drive — typing a service name cut 4,056 rows to 50
-                          — is one click here. */}
-                      <Chip
-                        size="small"
-                        variant="outlined"
-                        label="only this service"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setService(group.service);
-                        }}
-                      />
                     </Stack>
                     {open && (
                       <table style={{ borderCollapse: 'collapse', width: '100%' }}>
                         <tbody>
-                          {group.runs.slice(0, RUNS_PER_GROUP).map((run, i) => (
-                            <Fragment key={`${run.startNs}:${i}`}>
+                          {group.hours.map((hour, i) => (
+                            <Fragment key={`${hour.startMs ?? 'undated'}:${i}`}>
                               <tr
-                                onClick={() => onDrill(run)}
-                                aria-busy={drilling && drillTarget === run}
+                                onClick={() => onDrill(hour)}
+                                aria-busy={drilling && drillTarget === hour}
                                 data-testid="needle-window-row"
                                 style={{
                                   borderTop: '1px solid rgba(128,128,128,0.08)',
-                                  cursor: 'pointer',
+                                  cursor: service === '' ? 'default' : 'pointer',
                                 }}
-                                title="Grep this window for verbatim matches"
+                                title={
+                                  service === ''
+                                    ? 'Name a service above to grep this hour for verbatim matches'
+                                    : `Grep this hour of ${service} for verbatim matches`
+                                }
                               >
                                 <td style={{ padding: '5px 12px 5px 24px' }}>
                                   <Typography variant="body2" sx={{ ...mono, fontSize: 12 }}>
-                                    {runSpan(run)}
+                                    {hourSpan(hour)}
                                   </Typography>
                                 </td>
                                 <td style={{ padding: '5px 12px 5px 0' }}>
                                   <Typography variant="caption" color="text.secondary">
-                                    {run.windows > 1 ? `${run.windows.toLocaleString()} contiguous windows · ` : ''}
-                                    {run.eventCount.toLocaleString()} events
+                                    {hour.files.toLocaleString()} file{hour.files === 1 ? '' : 's'}
+                                    {hour.rowgroups > 0
+                                      ? ` · ${hour.rowgroups.toLocaleString()} rowgroup${
+                                          hour.rowgroups === 1 ? '' : 's'
+                                        }`
+                                      : ''}{' '}
+                                    · {formatBytes(hour.bytes)}
                                   </Typography>
                                 </td>
                                 <td style={{ padding: '5px 0' }}>
-                                  <SignalChip signal={run.signal} />
+                                  <VerdictChip verdict={hour.best} />
                                 </td>
                               </tr>
                               {/* U9: the answer belongs under the row that
                                   asked the question, not after the list. */}
-                              {drillTarget === run && (
+                              {drillTarget === hour && (
                                 <tr>
                                   <td colSpan={3} style={{ padding: 0 }}>
-                                    <DrillResult state={drill.state} grep={grep ?? null} token={searchedToken} />
+                                    <DrillResult state={drill.state} grep={grep ?? null} token={probedToken} />
                                   </td>
                                 </tr>
                               )}
@@ -1353,12 +1428,6 @@ function NeedleSection(): ReactElement {
                           ))}
                         </tbody>
                       </table>
-                    )}
-                    {open && group.runs.length > RUNS_PER_GROUP && (
-                      <Typography variant="caption" color="text.secondary" sx={{ display: 'block', pl: 3, pb: 1 }}>
-                        showing the {RUNS_PER_GROUP} strongest of {group.runs.length.toLocaleString()} runs — narrow the
-                        time range to see the rest
-                      </Typography>
                     )}
                   </Box>
                 );
