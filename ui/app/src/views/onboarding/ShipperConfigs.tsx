@@ -45,13 +45,18 @@ export const SHIPPERS: ShipperSnippet[] = [
   otlphttp/obsesc:
     endpoint: http://${host}:${port}
     encoding: proto
+    # When the node enforces security.ingest_tokens:
+    # headers:
+    #   authorization: "Bearer <ingest-token>"
 
 service:
   pipelines:
     logs:
+      # Dual-write: keep your incumbent exporter in the same list,
+      # e.g. exporters: [otlphttp/obsesc, datadog]
       exporters: [otlphttp/obsesc]
-    traces:
-      exporters: [otlphttp/obsesc]`,
+# Logs only — the node does not ingest traces yet; a traces pipeline
+# pointed here would 404 at the collector.`,
   },
   {
     id: 'otlp-grpc',
@@ -62,12 +67,18 @@ service:
     snippet: (host, port) => `exporters:
   otlp/obsesc:
     endpoint: ${host}:${port}
+    # The listener is plaintext unless the node is configured with TLS
+    # certificates; drop this once it is.
     tls:
       insecure: true
+    # When the node enforces security.ingest_tokens:
+    # headers:
+    #   authorization: "Bearer <ingest-token>"
 
 service:
   pipelines:
     logs:
+      # Dual-write: keep your incumbent exporter in the same list.
       exporters: [otlp/obsesc]`,
   },
   {
@@ -76,10 +87,14 @@ service:
     portKey: 'vector',
     description: 'Native vector protocol; pairs well with Vector agents already in your fleet.',
     language: 'toml',
-    snippet: (host, port) => `[sinks.obsesc]
+    snippet: (host, port) => `# Dual-write: add this sink alongside your incumbent's; both can
+# read the same inputs.
+[sinks.obsesc]
 type = "vector"
 inputs = ["my_logs"]
-address = "${host}:${port}"`,
+address = "${host}:${port}"
+# The vector sink cannot send an Authorization header; if the node
+# enforces security.ingest_tokens, ship via the ES bulk route instead.`,
   },
   {
     id: 'es-bulk',
@@ -87,14 +102,16 @@ address = "${host}:${port}"`,
     portKey: 'es_bulk',
     description: 'Drop-in for anything that already speaks ES — Filebeat, Logstash, Fluent-bit ES output.',
     language: 'yaml',
-    snippet: (host, port) => `# Fluent-bit example
+    snippet: (host, port) => `# Fluent-bit example — add as a SECOND [OUTPUT]; the incumbent's stays.
 [OUTPUT]
     Name           es
     Match          *
     Host           ${host}
     Port           ${port}
     Index          logs
-    Suppress_Type_Name On`,
+    Suppress_Type_Name On
+# fluent-bit's es output cannot send ApiKey/Bearer; when the node
+# enforces security.ingest_tokens, use Filebeat's api_key instead.`,
   },
   {
     id: 'hec',
@@ -102,7 +119,9 @@ address = "${host}:${port}"`,
     portKey: 'hec',
     description: 'For shops migrating off Splunk — same HEC token shape, no app rewrite.',
     language: 'bash',
-    snippet: (host, port) => `curl -sS -X POST "http://${host}:${port}/services/collector" \\
+    snippet: (host, port) => `# Token must be in the node's security.hec_tokens (HEC fails closed
+# until one is configured).
+curl -sS -X POST "http://${host}:${port}/services/collector" \\
   -H "Authorization: Splunk <your-token>" \\
   -H "content-type: application/json" \\
   -d '{ "event": "hello obsesc", "source": "my-app", "host": "my-host" }'`,
@@ -119,6 +138,11 @@ address = "${host}:${port}"`,
     host ${host}
     port ${port}
   </server>
+  # When the node sets security.fluent_shared_key:
+  # <security>
+  #   self_hostname my-host
+  #   shared_key <shared-key>
+  # </security>
 </match>`,
   },
 ];
