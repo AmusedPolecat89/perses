@@ -54,9 +54,13 @@ export interface DrainStatus {
 
 export interface CostPreview {
   currency: string;
-  current_monthly_usd: number;
-  projected_monthly_usd: number;
-  delta_monthly_usd: number;
+  /**
+   * `null` = unpriced (B4.4): a fleet node's instance type is outside the
+   * server's price table, so no honest total exists — never rendered as $0.
+   */
+  current_monthly_usd: number | null;
+  projected_monthly_usd: number | null;
+  delta_monthly_usd: number | null;
   nodes_before: number;
   nodes_after: number;
   /** Server-side pricing caveats — surfaced verbatim so costs stay honest. */
