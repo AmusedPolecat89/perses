@@ -51,6 +51,22 @@ export function CostPreviewBox({ preview, isLoading, error }: CostPreviewBoxProp
     );
   }
 
+  // B4.4: null totals mean the fleet contains a node the price table can't
+  // price — say "unpriced", never render a fabricated $0.
+  if (
+    preview.current_monthly_usd === null ||
+    preview.projected_monthly_usd === null ||
+    preview.delta_monthly_usd === null
+  ) {
+    return (
+      <Alert severity="warning" variant="outlined">
+        The current fleet can&apos;t be priced — a node&apos;s instance type is outside the price table, so no
+        honest estimate exists.
+        {preview.assumptions.length > 0 ? ` ${preview.assumptions.join(' · ')}` : ''}
+      </Alert>
+    );
+  }
+
   // Amber tint for a cost increase, green for a decrease, neutral for no-op.
   let tint = 'background.lighter';
   if (preview.delta_monthly_usd > 0) tint = 'rgba(245, 158, 11, 0.12)';
