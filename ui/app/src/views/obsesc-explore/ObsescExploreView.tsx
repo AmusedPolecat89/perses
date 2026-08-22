@@ -36,7 +36,9 @@ import { AsyncOpState, useAsyncOp } from '../../components/progress/useAsyncOp';
 import { OpErrorAlert } from '../../components/OpErrorAlert';
 import { eitherSignal } from '../../utils/either-signal';
 import { TimeRangeControl } from '../../components/TimeRangeControl';
+import { CopyLinkButton } from '../../components/CopyLinkButton';
 import { useSharedTimeRange } from '../../hooks/use-shared-time-range';
+import { useUrlBackedState } from '../../hooks/use-url-backed-state';
 import { ResolvedRange, isoSeconds, rangeKey, rangeLabel, resolveRange } from '../../model/time-range';
 import {
   CandidateDay,
@@ -524,7 +526,11 @@ function SqlSection(): ReactElement {
   // churn under the cursor while the operator is editing it.
   const { range } = useSharedTimeRange();
   const rangeK = rangeKey(range);
-  const [sql, setSql] = useState(() => materialise(SQL_PRESETS[0]!.sql, resolveRange(range, Date.now())));
+  // B3.5: the SQL text is URL-backed — a reload or a shared link restores
+  // the query (never auto-runs it; the recipient presses Run).
+  const [sql, setSql] = useUrlBackedState('sql', () =>
+    materialise(SQL_PRESETS[0]!.sql, resolveRange(range, Date.now()))
+  );
   const [lastRewrite, setLastRewrite] = useState<number | null>(null);
   const appliedRange = useRef(rangeK);
   // The editor's live text, readable from an effect without making that
@@ -1025,8 +1031,10 @@ function NeedleProbeNotes({ result }: { result: NeedleSearchResult }): ReactElem
 }
 
 function NeedleSection(): ReactElement {
-  const [token, setToken] = useState('');
-  const [service, setService] = useState('');
+  // B3.5: both needle inputs are URL-backed so the permalink carries the
+  // hunt (inputs only — the search itself is a click, never a page load).
+  const [token, setToken] = useUrlBackedState('needle', '');
+  const [service, setService] = useUrlBackedState('needle_service', '');
   // U11: no private Range dropdown here any more — the needle searches the
   // SAME window the SQL box, the dashboards and Investigate are looking at.
   const { range } = useSharedTimeRange();
@@ -1443,9 +1451,14 @@ function NeedleSection(): ReactElement {
 export default function ObsescExploreView(): ReactElement {
   return (
     <Box sx={{ padding: 3, maxWidth: 1280, mx: 'auto' }}>
-      <Typography variant="h4" sx={{ fontWeight: 700, letterSpacing: '-0.01em' }}>
-        Explore
-      </Typography>
+      <Stack direction="row" alignItems="flex-start" justifyContent="space-between" gap={1}>
+        <Typography variant="h4" sx={{ fontWeight: 700, letterSpacing: '-0.01em' }}>
+          Explore
+        </Typography>
+        {/* B3.5: the URL carries the SQL text, the needle inputs and the
+            shared range — this is the "share this investigation" handle. */}
+        <CopyLinkButton />
+      </Stack>
       <Typography variant="body2" color="text.secondary" sx={{ mt: 0.5, mb: 2 }}>
         The raw tier keeps 100% of every event as open Parquet. The summary index accelerates — it never gatekeeps.
       </Typography>

@@ -27,9 +27,17 @@
 
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import '@testing-library/jest-dom';
+import { MemoryRouter } from 'react-router-dom';
 import { ThemeProvider, createTheme } from '@mui/material/styles';
 import { resetSharedTimeRange, setSharedTimeRange } from '../../hooks/use-shared-time-range';
 import ObsescExploreView, { applyRangeToSql } from './ObsescExploreView';
+
+// This suite renders the WHOLE Explore view (two sections, MUI theme, and —
+// since B3.5 — a router for the URL-backed inputs) per test; several tests
+// were already at ~3 s under jsdom and the default 5 s limit flaked. The
+// limit protects against hangs, not against a heavy view; 20 s keeps it a
+// hang detector without making render cost look like a regression.
+jest.setTimeout(20_000);
 
 // jsdom here predates AbortSignal.timeout, which the view's apiFetch uses.
 beforeAll(() => {
@@ -67,9 +75,13 @@ function deferred<T>(): Deferred<T> {
 
 function renderExplore(): void {
   render(
-    <ThemeProvider theme={createTheme()}>
-      <ObsescExploreView />
-    </ThemeProvider>
+    // MemoryRouter: the view's inputs are URL-backed (B3.5), so rendering
+    // it requires a router context, exactly as in the app.
+    <MemoryRouter>
+      <ThemeProvider theme={createTheme()}>
+        <ObsescExploreView />
+      </ThemeProvider>
+    </MemoryRouter>
   );
 }
 
