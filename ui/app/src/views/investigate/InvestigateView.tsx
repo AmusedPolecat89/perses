@@ -17,13 +17,15 @@
 // the plugin renderer — keep in sync with DiffReportView
 // (ui/plugins/datasource-obsesc/src/plugins/investigate/DiffReportView.tsx).
 
-import { ReactElement, useMemo, useState } from 'react';
+import { ReactElement, useMemo } from 'react';
 import { Alert, Box, Button, Chip, Stack, TextField, Tooltip, Typography } from '@mui/material';
 import { AsyncOpBar, AsyncOpStatus, asyncOpTriggerProps } from '../../components/progress/AsyncOp';
 import { useAsyncOp } from '../../components/progress/useAsyncOp';
 import { eitherSignal } from '../../utils/either-signal';
 import { TimeRangeControl } from '../../components/TimeRangeControl';
+import { CopyLinkButton } from '../../components/CopyLinkButton';
 import { useSharedTimeRange } from '../../hooks/use-shared-time-range';
+import { useUrlBackedState } from '../../hooks/use-url-backed-state';
 import { localInputToMs, msToLocalInput, rangeKey, resolveRange } from '../../model/time-range';
 
 const API = '/obsesc-api';
@@ -210,7 +212,9 @@ const MATCH_EXPLAIN: Record<'Id' | 'Pattern', { label: string; explain: string }
 // ─── the view ───────────────────────────────────────────────────────────
 
 function InvestigateView(): ReactElement {
-  const [service, setService] = useState('svc-000');
+  // B3.5: the service under investigation is URL-backed — the permalink
+  // carries it (the diff itself is a click, never a page load).
+  const [service, setService] = useUrlBackedState('service', 'svc-000');
 
   // U11: the INCIDENT window is the shared range — the same one the
   // dashboards and Explore use — so an investigation that starts on a
@@ -226,8 +230,17 @@ function InvestigateView(): ReactElement {
   const previewIncident = useMemo(() => resolveRange(range, Date.now()), [rangeK]);
 
   // `null` = "still incident −24h", and it FOLLOWS the incident window when
-  // that moves. Only an explicit edit pins the baseline in place.
-  const [baselineEdit, setBaselineEdit] = useState<{ from: string; to: string } | null>(null);
+  // that moves. Only an explicit edit pins the baseline in place. B3.5: a
+  // pinned baseline is URL-backed (two params, both or neither meaningful)
+  // so the permalink reproduces the exact comparison.
+  const [baselineFromUrl, setBaselineFromUrl] = useUrlBackedState('baseline_from', '');
+  const [baselineToUrl, setBaselineToUrl] = useUrlBackedState('baseline_to', '');
+  const baselineEdit =
+    baselineFromUrl !== '' && baselineToUrl !== '' ? { from: baselineFromUrl, to: baselineToUrl } : null;
+  const setBaselineEdit = (v: { from: string; to: string } | null): void => {
+    setBaselineFromUrl(v?.from ?? '');
+    setBaselineToUrl(v?.to ?? '');
+  };
   const baselineFrom = baselineEdit?.from ?? msToLocalInput(previewIncident.fromMs - DAY_MS);
   const baselineTo = baselineEdit?.to ?? msToLocalInput(previewIncident.toMs - DAY_MS);
 
@@ -300,9 +313,14 @@ function InvestigateView(): ReactElement {
 
   return (
     <Box sx={{ padding: 3, maxWidth: 1200, margin: '0 auto' }}>
-      <Typography variant="h4" sx={{ fontWeight: 700, letterSpacing: '-0.01em' }}>
-        Investigate
-      </Typography>
+      <Stack direction="row" alignItems="flex-start" justifyContent="space-between" gap={1}>
+        <Typography variant="h4" sx={{ fontWeight: 700, letterSpacing: '-0.01em' }}>
+          Investigate
+        </Typography>
+        {/* B3.5: service, pinned baseline and the shared range all live in
+            the URL — this is the "share this investigation" handle. */}
+        <CopyLinkButton />
+      </Stack>
       <Typography variant="body2" color="text.secondary" sx={{ mb: 2.5 }}>
         Differential forensics: pick a broken window and a healthy baseline, hit diff. The comparison runs over the
         summary sketches in memory — no raw scan, rate-normalized so window sizes don&apos;t have to match.
