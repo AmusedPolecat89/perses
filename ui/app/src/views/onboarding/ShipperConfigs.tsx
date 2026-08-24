@@ -55,8 +55,10 @@ service:
       # Dual-write: keep your incumbent exporter in the same list,
       # e.g. exporters: [otlphttp/obsesc, datadog]
       exporters: [otlphttp/obsesc]
-# Logs only — the node does not ingest traces yet; a traces pipeline
-# pointed here would 404 at the collector.`,
+    traces:
+      # OBSESC keeps 100% of spans — send this feed UNSAMPLED and leave
+      # any sampling on the incumbent's own exporter.
+      exporters: [otlphttp/obsesc]`,
   },
   {
     id: 'otlp-grpc',
@@ -79,6 +81,10 @@ service:
   pipelines:
     logs:
       # Dual-write: keep your incumbent exporter in the same list.
+      exporters: [otlp/obsesc]
+    traces:
+      # OBSESC keeps 100% of spans — send this feed UNSAMPLED and leave
+      # any sampling on the incumbent's own exporter.
       exporters: [otlp/obsesc]`,
   },
   {
